@@ -44,12 +44,13 @@ auth_pwd(char *username, char *password)
 {
 	struct passwd *pw;
 
+	errno = 0;
 	do {
 		pw = getpwnam(username);
 	} while (pw == NULL && errno == EINTR);
 
 	if (pw == NULL) {
-		if (errno == EIO || errno == EMFILE || errno == ENFILE || errno == ENOMEM)
+		if (errno)
 			return -1;
 		return 0;
 	}
