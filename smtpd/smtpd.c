@@ -1252,8 +1252,8 @@ imsg_dispatch(int fd, short event, void *p)
 	ssize_t			 n;
 	struct timespec		 t0, t1, dt;
 
-	MONKEY_PAUSE(arc4random() % 3);
 	if (event & EV_READ) {
+		MONKEY_PAUSE(arc4random() % 3);
 		if ((n = imsg_read(&iev->ibuf)) == -1)
 			err(1, "%s: imsg_read", proc_to_str(smtpd_process));
 		if (n == 0) {
@@ -1264,20 +1264,18 @@ imsg_dispatch(int fd, short event, void *p)
 		}
 	}
 
-	MONKEY_PAUSE(arc4random() % 3);
 	if (event & EV_WRITE) {
+		MONKEY_PAUSE(arc4random() % 3);
 		if (msgbuf_write(&iev->ibuf.w) == -1)
 			err(1, "%s: msgbuf_write", proc_to_str(smtpd_process));
 	}
 
-	MONKEY_PAUSE(arc4random() % 3);
 	for (;;) {
 		if ((n = imsg_get(&iev->ibuf, &imsg)) == -1)
 			err(1, "%s: imsg_get", proc_to_str(smtpd_process));
 		if (n == 0)
 			break;
 
-		MONKEY_PAUSE(arc4random() % 3);
 		log_imsg(smtpd_process, iev->proc, &imsg);
 
 		if (profiling || profstat)
