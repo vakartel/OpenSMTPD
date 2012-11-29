@@ -25,9 +25,12 @@
 #define MONKEY_SET(x, y)
 
 #else
-#define	MONKEY_RETURN(x)	do { if (arc4random() % 2) return (x); } while (0)
-#define	MONKEY_PAUSE(x)		do { if (arc4random() % 2) sleep (x); } while (0)
-#define	MONKEY_SET(x, y)       	do { if (arc4random() % 2) (x) = (y); } while (0)
+#if ! defined(MONKEY_RATE)
+#define	MONKEY_RATE		8
+#endif
+#define	MONKEY_RETURN(x)	do { if (!(arc4random() % MONKEY_RATE)) return (x); } while (0)
+#define	MONKEY_PAUSE(x)		do { if (!(arc4random() % MONKEY_RATE)) sleep (x); } while (0)
+#define	MONKEY_SET(x, y)       	do { if (!(arc4random() % MONKEY_RATE)) (x) = (y); } while (0)
 
 #endif
 
