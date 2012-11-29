@@ -26,6 +26,8 @@
 #include "ioev.h"
 #include "iobuf.h"
 
+#include "monkey.h"
+
 #define CONF_FILE		 "/etc/mail/smtpd.conf"
 #define MAX_LISTEN		 16
 #define PROC_COUNT		 9

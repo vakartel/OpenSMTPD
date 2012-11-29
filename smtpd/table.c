@@ -72,6 +72,9 @@ int
 table_lookup(struct table *table, const char *key, enum table_service kind,
     void **retp)
 {
+	/* XXX - simulate temporary error */
+	MONKEY_RETURN(-1);
+
 	return table->t_backend->lookup(table->t_handle, key, kind, retp);
 }
 
