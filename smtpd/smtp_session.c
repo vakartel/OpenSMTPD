@@ -504,11 +504,6 @@ smtp_session_imsg(struct imsgev *iev, struct imsg *imsg)
 		    " on a line by itself");
 
 		tree_xset(&wait_mfa_data, s->id, s);
-		/* By-pass mfa for message body if no filter registered. */
-		if (!(env->filtermask & HOOK_DATALINE)) {
-			log_debug("debug: disabling mfa for msg body");
-			s->msgflags |= MF_MFA_DATA_END;
-		}
 		io_reload(&s->io);
 		return;
 
@@ -650,8 +645,11 @@ smtp_io(struct io *io, int evt)
 		/* Message body */
 		if (s->state == STATE_BODY && strcmp(line, ".")) {
 			/* Discard data if the mfa already ended the message */
-			if (s->msgflags & MF_MFA_DATA_END)
+			/* XXX not for now */
+			/*
+			  if (s->msgflags & MF_MFA_DATA_END)
 				goto nextline;
+			*/
 			if (s->msgflags & MF_SMTP_HEADERS_END)
 				smtp_message_dataline(s, line);
 			else {
@@ -934,6 +932,12 @@ smtp_command(struct smtp_session *s, char *line)
 			    "553 Recipient address syntax error");
 			break;
 		}
+		if (*args) {
+			smtp_reply(s,
+			    "553 No option supported on RCPT TO");
+			break;
+		}
+
 		mfa_req.reqid = s->id;
 		mfa_req.u.evp = s->evp;
 		imsg_compose_event(env->sc_ievs[PROC_MFA], IMSG_MFA_RCPT,
@@ -951,7 +955,7 @@ smtp_command(struct smtp_session *s, char *line)
 		imsg_compose_event(env->sc_ievs[PROC_MFA], IMSG_MFA_RSET,
 		    0, 0, -1, &mfa_req, sizeof(mfa_req));
 
-		if (queue_req.evpid) {
+		if (s->evp.id) {
 			queue_req.reqid = s->id;
 			queue_req.evpid = s->evp.id;
 			imsg_compose_event(env->sc_ievs[PROC_QUEUE],
@@ -1114,9 +1118,10 @@ smtp_parse_mail_args(struct smtp_session *s, char *args)
 {
 	char *b;
 
-	for (; (b = strsep(&args, " ")) != NULL; ) {
+	while ((b = strsep(&args, " "))) {
 		if (*b == '\0')
 			continue;
+
 		if (strncasecmp(b, "AUTH=", 5) == 0)
 			log_debug("debug: smtp: AUTH in MAIL FROM command");
 		else if (strncasecmp(b, "SIZE=", 5) == 0)
@@ -1124,7 +1129,7 @@ smtp_parse_mail_args(struct smtp_session *s, char *args)
 		else if (!strcasecmp(b, "BODY=7BIT"))
 			/* XXX only for this transaction */
 			s->flags &= ~SF_8BITMIME;
-		else if (strcasecmp(b, "BODY=8BITMIME"))
+		else if (strcasecmp(b, "BODY=8BITMIME") == 0)
 			;
 		else {
 			smtp_reply(s, "503 Unsupported option %s", b);
@@ -1180,7 +1185,7 @@ smtp_message_headerline(struct smtp_session *s, char *line)
 		req.reqid = s->id;
 		if (strlcpy(req.u.buffer, line, sizeof(req.u.buffer))
 		    >= (sizeof req.u.buffer))
-			fatalx("overflow in smtp_body()");
+			fatalx("overflow in smtp_message_headerline()");
 		imsg_compose_event(env->sc_ievs[PROC_MFA], IMSG_MFA_HEADERLINE,
 		    0, 0, -1, &req, sizeof(req));
 	}
@@ -1209,7 +1214,7 @@ smtp_message_dataline(struct smtp_session *s, char *line)
 		req.reqid = s->id;
 		if (strlcpy(req.u.buffer, line, sizeof(req.u.buffer))
 		    >= (sizeof req.u.buffer))
-			fatalx("overflow in smtp_body()");
+			fatalx("overflow in smtp_message_dataline()");
 		imsg_compose_event(env->sc_ievs[PROC_MFA], IMSG_MFA_DATALINE,
 		    0, 0, -1, &req, sizeof(req));
 	}
@@ -1265,9 +1270,6 @@ smtp_message_end(struct smtp_session *s)
 	struct queue_req_msg	queue_req;
 
 	log_debug("debug: %p: end of message, msgflags=0x%04x", s, s->msgflags);
-
-	if (!(s->msgflags & MF_SMTP_DATA_END && s->msgflags & MF_MFA_DATA_END))
-		return;
 
 	tree_xpop(&wait_mfa_data, s->id);
 
@@ -1366,7 +1368,7 @@ smtp_free(struct smtp_session *s, const char * reason)
 
 	tree_pop(&wait_mfa_data, s->id);
 
-	if (s->evp.id != 0) {
+	if (s->evp.id) {
 		queue_req.reqid = s->id;
 		queue_req.evpid = s->evp.id;
 		imsg_compose_event(env->sc_ievs[PROC_QUEUE],
@@ -1405,8 +1407,10 @@ smtp_mailaddr(struct mailaddr *maddr, char *line, int mailfrom, char **args)
 	e = strchr(line, '>');
 	if (e == NULL)
 		return (0);
-	*e = '\0';
-	*args = e + 1;
+	*e++ = '\0';
+	while(*e == ' ')
+		e++;
+	*args = e;
 
 	if (!email_to_mailaddr(maddr, line + 1))
 		return (0);
