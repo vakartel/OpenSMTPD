@@ -28,12 +28,14 @@
 #include <sys/uio.h>
 #include <sys/mman.h>
 
+#include <bsd_auth.h>
 #include <dirent.h>
 #include <err.h>
 #include <errno.h>
-#include <fcntl.h>
 #include <event.h>
+#include <fcntl.h>
 #include <imsg.h>
+#include <login_cap.h>
 #include <paths.h>
 #include <pwd.h>
 #include <signal.h>
@@ -55,7 +57,7 @@ static void parent_send_config_client_certs(void);
 static void parent_send_config_ruleset(int);
 static void parent_sig_handler(int, short, void *);
 static void forkmda(struct imsgev *, uint32_t, struct deliver *);
-static int parent_forward_open(char *);
+static int parent_forward_open(char *, char *, uid_t, gid_t);
 static void fork_peers(void);
 static struct child *child_add(pid_t, int, const char *);
 
@@ -66,6 +68,7 @@ static int	offline_enqueue(char *);
 
 static void	purge_task(int, short, void *);
 static void	log_imsg(int, int, struct imsg *);
+static int	parent_auth_user(char *, char *);
 
 enum child_type {
 	CHILD_DAEMON,
@@ -119,7 +122,6 @@ parent_imsg(struct imsgev *iev, struct imsg *imsg)
 {
 	struct forward_req	*fwreq;
 	struct auth		*auth;
-	struct auth_backend	*auth_backend;
 	struct child		*c;
 	size_t			 len;
 	void			*i;
@@ -130,20 +132,6 @@ parent_imsg(struct imsgev *iev, struct imsg *imsg)
 		case IMSG_PARENT_SEND_CONFIG:
 			parent_send_config_listeners();
 			return;
-
-		case IMSG_PARENT_AUTHENTICATE:
-			auth_backend = auth_backend_lookup(AUTH_BSD);
-			auth = imsg->data;
-			auth->success = auth_backend->authenticate(auth->user,
-			    auth->pass);
-
-			/* XXX - for now, smtp does not handle temporary failures */
-			if (auth->success == -1)
-				auth->success = 0;
-
-			imsg_compose_event(iev, IMSG_PARENT_AUTHENTICATE, 0, 0,
-			    -1, auth, sizeof *auth);
-			return;
 		}
 	}
 
@@ -151,7 +139,8 @@ parent_imsg(struct imsgev *iev, struct imsg *imsg)
 		switch (imsg->hdr.type) {
 		case IMSG_PARENT_FORWARD_OPEN:
 			fwreq = imsg->data;
-			fd = parent_forward_open(fwreq->as_user);
+			fd = parent_forward_open(fwreq->user, fwreq->directory,
+			    fwreq->uid, fwreq->gid);
 			fwreq->status = 0;
 			if (fd == -1 && errno != ENOENT) {
 				if (errno == EAGAIN)
@@ -161,6 +150,19 @@ parent_imsg(struct imsgev *iev, struct imsg *imsg)
 				fwreq->status = 1;
 			imsg_compose_event(iev, IMSG_PARENT_FORWARD_OPEN, 0, 0,
 			    fd, fwreq, sizeof *fwreq);
+			return;
+
+		case IMSG_LKA_AUTHENTICATE:
+			/* If we reached here, it means we want root to lookup system user */
+			auth = imsg->data;
+
+			auth->success = parent_auth_user(auth->user, auth->pass);
+			/* XXX - for now, smtp does not handle temporary failures */
+			if (auth->success == -1)
+				auth->success = 0;
+
+			imsg_compose_event(iev, IMSG_LKA_AUTHENTICATE, 0, 0,
+			    -1, auth, sizeof *auth);
 			return;
 		}
 	}
@@ -419,6 +421,12 @@ parent_send_config_ruleset(int proc)
 				    &r->r_mapping->t_name,
 				    sizeof(r->r_mapping->t_name));
 			}
+			if (r->r_users) {
+				imsg_compose_event(env->sc_ievs[proc],
+				    IMSG_CONF_RULE_USERS, 0, 0, -1,
+				    &r->r_users->t_name,
+				    sizeof(r->r_users->t_name));
+			}
 		}
 	}
 
@@ -535,6 +543,8 @@ main(int argc, char *argv[])
 	struct event	 ev_sigchld;
 	struct event	 ev_sighup;
 	struct timeval	 tv;
+	struct listener	*l;
+	struct rule	*r;
 	struct peer	 peers[] = {
 		{ PROC_CONTROL,	imsg_dispatch },
 		{ PROC_LKA,	imsg_dispatch },
@@ -714,6 +724,24 @@ main(int argc, char *argv[])
 		errx(1, "machine does not have a hostname set");
 	env->sc_uptime = time(NULL);
 
+	log_debug("debug: init server-ssl tree");
+	TAILQ_FOREACH(l, env->sc_listeners, entry) {
+		if (l->flags & F_SSL) {
+			if (ssl_load_certfile(l->ssl_cert_name, F_SCERT) < 0)
+				errx(1, "cannot load certificate: %s", l->ssl_cert_name);
+		}
+	}
+
+	log_debug("debug: init client-ssl tree");
+	TAILQ_FOREACH(r, env->sc_rules, r_entry) {
+		if (r->r_action != A_RELAY && r->r_action != A_RELAYVIA)
+			continue;
+		if (! r->r_value.relayhost.cert[0])
+			continue;
+		if (ssl_load_certfile(r->r_value.relayhost.cert, F_CCERT) < 0)
+			errx(1, "cannot load certificate: %s", r->r_value.relayhost.cert);
+	}
+	
 	fork_peers();
 
 	smtpd_process = PROC_PARENT;
@@ -912,27 +940,15 @@ forkmda(struct imsgev *iev, uint32_t id,
 	struct child	*child;
 	pid_t		 pid;
 	int		 n, allout, pipefd[2];
-	struct table		*t;
-	struct table_userinfo	*tu;
-	int		 r;
 
 	log_debug("debug: forkmda: to \"%s\" as %s",
 	    deliver->to, deliver->user);
-
-	t = table_findbyname("<getpwnam>");
-	r = table_lookup(t, deliver->user, K_USERINFO, (void **)&tu);
-	if (r <= 0) {
-		n = snprintf(ebuf, sizeof ebuf, "getpwnam: %s",
-		    errno ? strerror(errno) : "no such user");
-		imsg_compose_event(iev, IMSG_MDA_DONE, id, 0, -1, ebuf, n + 1);
-		return;
-	}
 
 	db = delivery_backend_lookup(deliver->mode);
 	if (db == NULL)
 		return;
 
-	if (tu->uid == 0 && ! db->allow_root) {
+	if (deliver->userinfo.uid == 0 && ! db->allow_root) {
 		n = snprintf(ebuf, sizeof ebuf, "not allowed to deliver to: %s",
 		    deliver->user);
 		imsg_compose_event(iev, IMSG_MDA_DONE, id, 0, -1, ebuf, n + 1);
@@ -940,7 +956,7 @@ forkmda(struct imsgev *iev, uint32_t id,
 	}
 
 	/* lower privs early to allow fork fail due to ulimit */
-	if (seteuid(tu->uid) < 0)
+	if (seteuid(deliver->userinfo.uid) < 0)
 		fatal("smtpd: forkmda: cannot lower privileges");
 
 	if (pipe(pipefd) < 0) {
@@ -979,7 +995,6 @@ forkmda(struct imsgev *iev, uint32_t id,
 
 	/* parent passes the child fd over to mda */
 	if (pid > 0) {
-		free(tu);
 		if (seteuid(0) < 0)
 			fatal("smtpd: forkmda: cannot restore privileges");
 		child = child_add(pid, CHILD_MDA, NULL);
@@ -994,7 +1009,7 @@ forkmda(struct imsgev *iev, uint32_t id,
 #define error(m) { perror(m); _exit(1); }
 	if (seteuid(0) < 0)
 		error("forkmda: cannot restore privileges");
-	if (chdir(tu->directory) < 0 && chdir("/") < 0)
+	if (chdir(deliver->userinfo.directory) < 0 && chdir("/") < 0)
 		error("chdir");
 	if (dup2(pipefd[0], STDIN_FILENO) < 0 ||
 	    dup2(allout, STDOUT_FILENO) < 0 ||
@@ -1002,9 +1017,9 @@ forkmda(struct imsgev *iev, uint32_t id,
 		error("forkmda: dup2");
 	if (closefrom(STDERR_FILENO + 1) < 0)
 		error("closefrom");
-	if (setgroups(1, &tu->gid) ||
-	    setresgid(tu->gid, tu->gid, tu->gid) ||
-	    setresuid(tu->uid, tu->uid, tu->uid))
+	if (setgroups(1, &deliver->userinfo.gid) ||
+	    setresgid(deliver->userinfo.gid, deliver->userinfo.gid, deliver->userinfo.gid) ||
+	    setresuid(deliver->userinfo.uid, deliver->userinfo.uid, deliver->userinfo.uid))
 		error("forkmda: cannot drop privileges");
 	if (setsid() < 0)
 		error("setsid");
@@ -1201,24 +1216,13 @@ offline_done(void)
 }
 
 static int
-parent_forward_open(char *username)
+parent_forward_open(char *username, char *directory, uid_t uid, gid_t gid)
 {
-	struct table		*t;
-	struct table_userinfo	*tu;
 	char pathname[MAXPATHLEN];
 	int	fd;
-	int	r;
-
-	t = table_findbyname("<getpwnam>");
-	r = table_lookup(t, username, K_USERINFO, (void **)&tu);
-	if (r <= 0) {
-		if (r == -1)
-			errno = EAGAIN;
-		return -1;
-	}
 
 	if (! bsnprintf(pathname, sizeof (pathname), "%s/.forward",
-		tu->directory))
+		directory))
 		fatal("smtpd: parent_forward_open: snprintf");
 
 	do {
@@ -1235,7 +1239,7 @@ parent_forward_open(char *username)
 		return -1;
 	}
 
-	if (! secure_file(fd, pathname, tu->directory, tu->uid, 1)) {
+	if (! secure_file(fd, pathname, directory, uid, 1)) {
 		log_warnx("warn: smtpd: %s: unsecure file", pathname);
 		close(fd);
 		return -1;
@@ -1375,12 +1379,16 @@ imsg_to_str(int type)
 	CASE(IMSG_CONF_RULE_SOURCE);
 	CASE(IMSG_CONF_RULE_DESTINATION);
 	CASE(IMSG_CONF_RULE_MAPPING);
+	CASE(IMSG_CONF_RULE_USERS);
 	CASE(IMSG_CONF_FILTER);
 	CASE(IMSG_CONF_END);
 
 	CASE(IMSG_LKA_UPDATE_TABLE);
 	CASE(IMSG_LKA_EXPAND_RCPT);
 	CASE(IMSG_LKA_SECRET);
+	CASE(IMSG_LKA_SOURCE);
+	CASE(IMSG_LKA_USERINFO);
+	CASE(IMSG_LKA_AUTHENTICATE);
 
 	CASE(IMSG_MDA_SESS_NEW);
 	CASE(IMSG_MDA_DONE);
@@ -1428,7 +1436,6 @@ imsg_to_str(int type)
 	CASE(IMSG_PARENT_FORWARD_OPEN);
 	CASE(IMSG_PARENT_FORK_MDA);
 	CASE(IMSG_PARENT_KILL_MDA);
-	CASE(IMSG_PARENT_AUTHENTICATE);
 	CASE(IMSG_PARENT_SEND_CONFIG);
 
 	CASE(IMSG_SMTP_ENQUEUE);
@@ -1437,8 +1444,9 @@ imsg_to_str(int type)
 
 	CASE(IMSG_DNS_HOST);
 	CASE(IMSG_DNS_HOST_END);
-	CASE(IMSG_DNS_MX);
 	CASE(IMSG_DNS_PTR);
+	CASE(IMSG_DNS_MX);
+	CASE(IMSG_DNS_MX_PREFERENCE);
 
 	CASE(IMSG_STAT_INCREMENT);
 	CASE(IMSG_STAT_DECREMENT);
@@ -1452,4 +1460,10 @@ imsg_to_str(int type)
 
 		return buf;
 	}
+}
+
+int
+parent_auth_user(char *username, char *password)
+{
+	return auth_userokay(username, NULL, "auth-smtp", password);
 }
