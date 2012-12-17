@@ -178,7 +178,7 @@ mta_session(struct mta_relay *relay, struct mta_route *route)
 }
 
 void
-mta_session_imsg(struct imsgev *iev, struct imsg *imsg)
+mta_session_imsg(struct mproc *p, struct imsg *imsg)
 {
 	uint64_t		 id;
 	struct mta_session	*s;
@@ -200,7 +200,7 @@ mta_session_imsg(struct imsgev *iev, struct imsg *imsg)
 			log_debug("debug: mta: loop detected");
 			fclose(s->datafp);
 			s->datafp = NULL;
-			mta_flush_task(s, IMSG_QUEUE_DELIVERY_LOOP,
+			mta_flush_task(s, IMSG_DELIVERY_LOOP,
 			    "Loop detected");
 			mta_enter_state(s, MTA_READY);
 		} else {
@@ -396,8 +396,7 @@ mta_enter_state(struct mta_session *s, int newstate)
 			    mta_relay_to_text(s->relay));
 
 		stat_increment("mta.task.running", 1);
-		imsg_compose_event(env->sc_ievs[PROC_QUEUE],
-		    IMSG_QUEUE_MESSAGE_FD, s->task->msgid, 0, -1,
+		m_compose(p_queue, IMSG_QUEUE_MESSAGE_FD, s->task->msgid, 0, -1,
 		    &s->id, sizeof(s->id));
 		tree_xset(&wait_fd, s->id, s);
 		break;
@@ -524,9 +523,9 @@ mta_response(struct mta_session *s, char *line)
 	case MTA_MAIL:
 		if (line[0] != '2') {
 			if (line[0] == '5')
-				delivery = IMSG_QUEUE_DELIVERY_PERMFAIL;
+				delivery = IMSG_DELIVERY_PERMFAIL;
 			else
-				delivery = IMSG_QUEUE_DELIVERY_TEMPFAIL;
+				delivery = IMSG_DELIVERY_TEMPFAIL;
 			mta_flush_task(s, delivery, line);
 			mta_enter_state(s, MTA_RSET);
 			return;
@@ -539,14 +538,14 @@ mta_response(struct mta_session *s, char *line)
 		s->currevp = TAILQ_NEXT(s->currevp, entry);
 		if (line[0] != '2') {
 			if (line[0] == '5')
-				delivery = IMSG_QUEUE_DELIVERY_PERMFAIL;
+				delivery = IMSG_DELIVERY_PERMFAIL;
 			else
-				delivery = IMSG_QUEUE_DELIVERY_TEMPFAIL;
+				delivery = IMSG_DELIVERY_TEMPFAIL;
 			TAILQ_REMOVE(&s->task->envelopes, evp, entry);
 			envelope_set_errormsg(evp, "%s", line);
 			mta_envelope_fail(evp, s->route, delivery);
 			if (TAILQ_EMPTY(&s->task->envelopes)) {
-				mta_flush_task(s, IMSG_QUEUE_DELIVERY_OK,
+				mta_flush_task(s, IMSG_DELIVERY_OK,
 				    "No envelope");
 				mta_enter_state(s, MTA_RSET);
 				break;
@@ -564,22 +563,22 @@ mta_response(struct mta_session *s, char *line)
 			break;
 		}
 		if (line[0] == '5')
-			delivery = IMSG_QUEUE_DELIVERY_PERMFAIL;
+			delivery = IMSG_DELIVERY_PERMFAIL;
 		else
-			delivery = IMSG_QUEUE_DELIVERY_TEMPFAIL;
+			delivery = IMSG_DELIVERY_TEMPFAIL;
 		mta_flush_task(s, delivery, line);
 		mta_enter_state(s, MTA_RSET);
 		break;
 
 	case MTA_EOM:
 		if (line[0] == '2') {
-			delivery = IMSG_QUEUE_DELIVERY_OK;
+			delivery = IMSG_DELIVERY_OK;
 			s->msgcount++;
 		}
 		else if (line[0] == '5')
-			delivery = IMSG_QUEUE_DELIVERY_PERMFAIL;
+			delivery = IMSG_DELIVERY_PERMFAIL;
 		else
-			delivery = IMSG_QUEUE_DELIVERY_TEMPFAIL;
+			delivery = IMSG_DELIVERY_TEMPFAIL;
 		mta_flush_task(s, delivery, line);
 		mta_enter_state(s, MTA_READY);
 		break;
@@ -764,7 +763,7 @@ mta_queue_data(struct mta_session *s)
 	}
 
 	if (ferror(s->datafp)) {
-		mta_flush_task(s, IMSG_QUEUE_DELIVERY_TEMPFAIL,
+		mta_flush_task(s, IMSG_DELIVERY_TEMPFAIL,
 		    "Error reading content file");
 		return (-1);
 	}
@@ -786,14 +785,14 @@ mta_flush_task(struct mta_session *s, int delivery, const char *error)
 	size_t		 n;
 
 	switch (delivery) {
-	case IMSG_QUEUE_DELIVERY_OK:
+	case IMSG_DELIVERY_OK:
 		pfx = "Ok";
 		break;
-	case IMSG_QUEUE_DELIVERY_TEMPFAIL:
+	case IMSG_DELIVERY_TEMPFAIL:
 		pfx = "TempFail";
 		break;
-	case IMSG_QUEUE_DELIVERY_PERMFAIL:
-	case IMSG_QUEUE_DELIVERY_LOOP:
+	case IMSG_DELIVERY_PERMFAIL:
+	case IMSG_DELIVERY_LOOP:
 		pfx = "PermFail";
 		break;
 	default:
@@ -808,8 +807,7 @@ mta_flush_task(struct mta_session *s, int delivery, const char *error)
 		TAILQ_REMOVE(&s->task->envelopes, e, entry);
 		envelope_set_errormsg(e, "%s", error);
 		log_envelope(e, relay, pfx, error);
-		imsg_compose_event(env->sc_ievs[PROC_QUEUE], delivery,
-		    0, 0, -1, e, sizeof(*e));
+		m_compose(p_queue, delivery, 0, 0, -1, e, sizeof(*e));
 		free(e);
 		n++;
 	}
@@ -828,7 +826,7 @@ mta_envelope_fail(struct envelope *evp, struct mta_route *route, int delivery)
 	char relay[MAX_LINE_SIZE], stat[MAX_LINE_SIZE];
 	const char *pfx;
 
-	if (delivery == IMSG_QUEUE_DELIVERY_TEMPFAIL)
+	if (delivery == IMSG_DELIVERY_TEMPFAIL)
 		pfx = "TempFail";
 	else
 		pfx = "PermFail";
@@ -838,8 +836,7 @@ mta_envelope_fail(struct envelope *evp, struct mta_route *route, int delivery)
 
 	snprintf(stat, sizeof stat, "RemoteError (%s)", &evp->errorline[4]);
 	log_envelope(evp, relay, pfx, stat);
-	imsg_compose_event(env->sc_ievs[PROC_QUEUE], delivery, 0, 0, -1,
-	    evp, sizeof(*evp));
+	m_compose(p_queue, delivery, 0, 0, -1, evp, sizeof(*evp));
 }
 
 static void
@@ -865,7 +862,7 @@ mta_error(struct mta_session *s, const char *fmt, ...)
 	mta_route_error(s->relay, s->route, error);
 
 	if (s->task)
-		mta_flush_task(s, IMSG_QUEUE_DELIVERY_TEMPFAIL, error);
+		mta_flush_task(s, IMSG_DELIVERY_TEMPFAIL, error);
 
 	free(error);
 }

@@ -50,7 +50,7 @@
 #define MAXCONN_PER_SOURCE	50
 #define MAXCONN_PER_RELAY	100
 
-static void mta_imsg(struct imsgev *, struct imsg *);
+static void mta_imsg(struct mproc *, struct imsg *);
 static void mta_shutdown(void);
 static void mta_sig_handler(int, short, void *);
 
@@ -128,7 +128,7 @@ static struct tree wait_secret;
 static struct tree wait_source;
 
 void
-mta_imsg(struct imsgev *iev, struct imsg *imsg)
+mta_imsg(struct mproc *p, struct imsg *imsg)
 {
 	struct lka_source_resp_msg	*resp_addr;
 	struct dns_resp_msg	*resp_dns;
@@ -144,10 +144,10 @@ mta_imsg(struct imsgev *iev, struct imsg *imsg)
 	struct ssl		*ssl;
 	uint64_t		 id;
 
-	if (iev->proc == PROC_QUEUE) {
+	if (p->proc == PROC_QUEUE) {
 		switch (imsg->hdr.type) {
 
-		case IMSG_BATCH_CREATE:
+		case IMSG_MTA_BATCH:
 			id = *(uint64_t*)(imsg->data);
 			batch = xmalloc(sizeof *batch, "mta_batch");
 			tree_init(batch);
@@ -156,7 +156,7 @@ mta_imsg(struct imsgev *iev, struct imsg *imsg)
 			    "mta: batch:%016" PRIx64 " created", id);
 			return;
 
-		case IMSG_BATCH_APPEND:
+		case IMSG_MTA_BATCH_ADD:
 			e = xmemdup(imsg->data, sizeof *e, "mta:envelope");
 			relay = mta_relay(e);
 			batch = tree_xget(&batches, e->batch_id);
@@ -189,7 +189,7 @@ mta_imsg(struct imsgev *iev, struct imsg *imsg)
 			    e->id, e->dest.user, e->dest.domain);
 			return;
 
-		case IMSG_BATCH_CLOSE:
+		case IMSG_MTA_BATCH_END:
 			id = *(uint64_t*)(imsg->data);
 			batch = tree_xpop(&batches, id);
 			log_trace(TRACE_MTA, "mta: batch:%016" PRIx64 " closed",
@@ -209,12 +209,12 @@ mta_imsg(struct imsgev *iev, struct imsg *imsg)
 			return;
 
 		case IMSG_QUEUE_MESSAGE_FD:
-			mta_session_imsg(iev, imsg);
+			mta_session_imsg(p, imsg);
 			return;
 		}
 	}
 
-	if (iev->proc == PROC_LKA) {
+	if (p->proc == PROC_LKA) {
 		switch (imsg->hdr.type) {
 
 		case IMSG_LKA_SECRET:
@@ -225,7 +225,7 @@ mta_imsg(struct imsgev *iev, struct imsg *imsg)
 			if (relay->secret == NULL) {
 				log_warnx("warn: Failed to retreive secret "
 				    "for relay %s", mta_relay_to_text(relay));
-				relay->fail = IMSG_QUEUE_DELIVERY_TEMPFAIL;
+				relay->fail = IMSG_DELIVERY_TEMPFAIL;
 				relay->failstr = "Could not retreive secret";
 			}
 			relay->status &= ~RELAY_WAIT_SECRET;
@@ -245,7 +245,7 @@ mta_imsg(struct imsgev *iev, struct imsg *imsg)
 			else {
 				log_warnx("warn: Failed to get source address"
 				    "for relay %s", mta_relay_to_text(relay));
-				relay->fail = IMSG_QUEUE_DELIVERY_TEMPFAIL;
+				relay->fail = IMSG_DELIVERY_TEMPFAIL;
 				relay->failstr = "Could not get source address";
 			}
 			mta_drain(relay);
@@ -309,12 +309,12 @@ mta_imsg(struct imsgev *iev, struct imsg *imsg)
 			return;
 
 		case IMSG_DNS_PTR:
-			mta_session_imsg(iev, imsg);
+			mta_session_imsg(p, imsg);
 			return;
 		}
 	}
 
-	if (iev->proc == PROC_PARENT) {
+	if (p->proc == PROC_PARENT) {
 		switch (imsg->hdr.type) {
 		case IMSG_CONF_START:
 			if (env->sc_flags & SMTPD_CONFIGURING)
@@ -374,17 +374,9 @@ pid_t
 mta(void)
 {
 	pid_t		 pid;
-
 	struct passwd	*pw;
 	struct event	 ev_sigint;
 	struct event	 ev_sigterm;
-
-	struct peer peers[] = {
-		{ PROC_PARENT,	imsg_dispatch },
-		{ PROC_QUEUE,	imsg_dispatch },
-		{ PROC_LKA,	imsg_dispatch },
-		{ PROC_CONTROL,	imsg_dispatch }
-	};
 
 	switch (pid = fork()) {
 	case -1:
@@ -433,8 +425,11 @@ mta(void)
 	signal(SIGPIPE, SIG_IGN);
 	signal(SIGHUP, SIG_IGN);
 
-	config_pipes(peers, nitems(peers));
-	config_peers(peers, nitems(peers));
+	config_peer(PROC_PARENT);
+	config_peer(PROC_QUEUE);
+	config_peer(PROC_LKA);
+	config_peer(PROC_CONTROL);
+	config_done();
 
 	if (event_dispatch() < 0)
 		fatal("event_dispatch");
@@ -566,8 +561,7 @@ mta_query_secret(struct mta_relay *relay)
 	secret.id = relay->id;
 	strlcpy(secret.tablename, relay->authtable, sizeof(secret.tablename));
 	strlcpy(secret.label, relay->authlabel, sizeof(secret.label));
-	imsg_compose_event(env->sc_ievs[PROC_LKA], IMSG_LKA_SECRET,
-	    0, 0, -1, &secret, sizeof(secret));
+	m_compose(p_lka, IMSG_LKA_SECRET, 0, 0, -1, &secret, sizeof(secret));
 	mta_relay_ref(relay);
 }
 
@@ -593,8 +587,7 @@ mta_query_source(struct mta_relay *relay)
 
 	req.reqid = relay->id;
 	strlcpy(req.tablename, relay->sourcetable, sizeof(req.tablename));
-	imsg_compose_event(env->sc_ievs[PROC_LKA], IMSG_LKA_SOURCE, 0, 0, -1,
-	    &req, sizeof(req));
+	m_compose(p_lka, IMSG_LKA_SOURCE, 0, 0, -1, &req, sizeof(req));
 	tree_xset(&wait_source, relay->id, relay);
 	relay->status |= RELAY_WAIT_SOURCE;
 	mta_relay_ref(relay);
@@ -613,19 +606,19 @@ mta_on_mx(void *tag, void *arg, void *data)
 	case DNS_OK:
 		break;
 	case DNS_RETRY:
-		relay->fail = IMSG_QUEUE_DELIVERY_TEMPFAIL;
+		relay->fail = IMSG_DELIVERY_TEMPFAIL;
 		relay->failstr = "Temporary failure in MX lookup";
 		break;
 	case DNS_EINVAL:
-		relay->fail = IMSG_QUEUE_DELIVERY_PERMFAIL;
+		relay->fail = IMSG_DELIVERY_PERMFAIL;
 		relay->failstr = "Invalid domain name";
 		break;
 	case DNS_ENONAME:
-		relay->fail = IMSG_QUEUE_DELIVERY_PERMFAIL;
+		relay->fail = IMSG_DELIVERY_PERMFAIL;
 		relay->failstr = "Domain does not exist";
 		break;
 	case DNS_ENOTFOUND:
-		relay->fail = IMSG_QUEUE_DELIVERY_TEMPFAIL;
+		relay->fail = IMSG_DELIVERY_TEMPFAIL;
 		relay->failstr = "No MX found for domain";
 		break;
 	default:
@@ -668,7 +661,7 @@ mta_on_source(struct mta_relay *relay, struct mta_source *source)
 		 */
 		log_debug("debug: mta: source already tried");
 		if (relay->nconn == 0) {
-			relay->fail = IMSG_QUEUE_DELIVERY_TEMPFAIL;
+			relay->fail = IMSG_DELIVERY_TEMPFAIL;
 			relay->failstr = "Could not find a valid source address";
 		}
 		mta_source_unref(source); /* from IMSG_LKA_SOURCE */
@@ -783,6 +776,9 @@ mta_drain(struct mta_relay *r)
 			mta_on_source(r, mta_source(NULL));
 	}
 
+	if (r->nconn == 0 && r->ntask && r->fail)
+		mta_drain(r);
+
     done:
 	mta_relay_unref(r); /* from here */
 }
@@ -799,9 +795,9 @@ mta_flush(struct mta_relay *relay, int fail, const char *error)
 	log_debug("debug: mta_flush(%s, %i, \"%s\")",
 	    mta_relay_to_text(relay), fail, error);
 
-	if (fail == IMSG_QUEUE_DELIVERY_TEMPFAIL)
+	if (fail == IMSG_DELIVERY_TEMPFAIL)
 		pfx = "TempFail";
-	else if (fail == IMSG_QUEUE_DELIVERY_PERMFAIL)
+	else if (fail == IMSG_DELIVERY_PERMFAIL)
 		pfx = "PermFail";
 	else
 		errx(1, "unexpected delivery status %i", fail);
@@ -815,8 +811,7 @@ mta_flush(struct mta_relay *relay, int fail, const char *error)
 			TAILQ_REMOVE(&task->envelopes, e, entry);
 			envelope_set_errormsg(e, "%s", error);
 			log_envelope(e, buf, pfx, e->errorline);
-			imsg_compose_event(env->sc_ievs[PROC_QUEUE], fail,
-			    0, 0, -1, e, sizeof(*e));
+			m_compose(p_queue, fail, 0, 0, -1, e, sizeof(*e));
 			free(e);
 			n++;
 		}
@@ -837,13 +832,14 @@ mta_find_route(struct mta_relay *relay, struct mta_source *source)
 	struct mta_route	*route, *best;
 	struct mta_mx		*mx;
 	int			 level, limit_host, limit_route;
-	int			 family_mismatch;
+	int			 family_mismatch, seen;
 
 	limit_host = 0;
 	limit_route = 0;
 	family_mismatch = 0;
 	level = -1;
 	best = NULL;
+	seen = 0;
 
 	TAILQ_FOREACH(mx, &relay->domain->mxs, entry) {
 		/*
@@ -881,6 +877,9 @@ mta_find_route(struct mta_relay *relay, struct mta_source *source)
 
 		if (mx->host->flags & HOST_IGNORE)
 			continue;
+
+		/* Found a possibly valid mx */
+		seen++;
 
 		if (mx->host->nconn >= MAXCONN_PER_HOST) {
 			limit_host = 1;
@@ -947,10 +946,10 @@ mta_find_route(struct mta_relay *relay, struct mta_source *source)
 	 * XXX Not until we tried all possible sources, and this might 
 	 * change when limits are reset.
 	 */
-	if (relay->nconn == 0) {
+	if (relay->nconn == 0 || seen == 0) {
 		log_info("smtp-out: No reachable MX for relay %s",
 		    mta_relay_to_text(relay));
-		relay->fail = IMSG_QUEUE_DELIVERY_TEMPFAIL;
+		relay->fail = IMSG_DELIVERY_TEMPFAIL;
 		relay->failstr = "No MX could be reached";
 	}
 
