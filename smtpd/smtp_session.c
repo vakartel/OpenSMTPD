@@ -484,14 +484,20 @@ smtp_mfa_response(struct smtp_session *s, struct mfa_smtp_resp_msg *resp)
 	code = resp->code ? resp->code : 0;
 	line = resp->line[0] ? resp->line : NULL;
 
+	MONKEY_SET(resp->status, MFA_CLOSE);
 	if (resp->status == MFA_CLOSE) {
 		code = code ? code : 421;
+		MONKEY_SET(line, "Chaos Monkey Caused Temporary Failure");
 		line = line ? line : "Temporary failure";
 		smtp_reply(s, "%d %s", code, line);
 		smtp_enter_state(s, STATE_QUIT);
 		io_reload(&s->io);
 		return;
 	}
+
+	MONKEY_SET(resp->status, MFA_FAIL);
+	MONKEY_SET(code, 566);
+	MONKEY_SET(line, "Chaos Monkey Caused Temporary Failure");
 
 	switch (s->mfa_imsg) {
 
