@@ -1,7 +1,7 @@
 /*	$OpenBSD: map_static.c,v 1.9 2012/11/12 14:58:53 eric Exp $	*/
 
 /*
- * Copyright (c) 2012 Gilles Chehade <gilles@openbsd.org>
+ * Copyright (c) 2012 Gilles Chehade <gilles@poolp.org>
  *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -199,10 +199,10 @@ table_static_lookup(void *hdl, const char *key, enum table_service service,
 
 	case K_SOURCE:
 		ret = table_static_source(key, line, len, retp);
+		break;
 
 	case K_USERINFO:
 		ret = table_static_userinfo(key, line, len, retp);
-
 		break;
 
 	default:
@@ -284,7 +284,7 @@ table_static_alias(const char *key, char *line, size_t len, void **retp)
 	struct expand		*xp;
 
 	xp = xcalloc(1, sizeof *xp, "table_static_alias");
-	if (! expand_line(xp, line))
+	if (! expand_line(xp, line, 1))
 		goto error;
 	*retp = xp;
 	return 1;

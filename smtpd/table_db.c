@@ -1,7 +1,7 @@
 /*	$OpenBSD: map_db.c,v 1.12 2012/11/12 14:58:53 eric Exp $	*/
 
 /*
- * Copyright (c) 2011 Gilles Chehade <gilles@openbsd.org>
+ * Copyright (c) 2011 Gilles Chehade <gilles@poolp.org>
  *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -324,7 +324,7 @@ table_db_alias(const char *key, char *line, size_t len, void **retp)
 	struct expand	*xp = NULL;
 
 	xp = xcalloc(1, sizeof *xp, "table_db_alias");
-	if (! expand_line(xp, line))
+	if (! expand_line(xp, line, 1))
 		goto error;
 	*retp = xp;
 	return 1;

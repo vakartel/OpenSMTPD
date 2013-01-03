@@ -1,7 +1,7 @@
 /*	$OpenBSD: mda.c,v 1.84 2012/11/12 14:58:53 eric Exp $	*/
 
 /*
- * Copyright (c) 2008 Gilles Chehade <gilles@openbsd.org>
+ * Copyright (c) 2008 Gilles Chehade <gilles@poolp.org>
  * Copyright (c) 2008 Pierre-Yves Ritschard <pyr@openbsd.org>
  * Copyright (c) 2009 Jacek Masiulaniec <jacekm@dobremiasto.net>
  * Copyright (c) 2012 Eric Faurot <eric@openbsd.org>
@@ -396,6 +396,7 @@ mda(void)
 	case -1:
 		fatal("mda: cannot fork");
 	case 0:
+		env->sc_pid = getpid();
 		break;
 	default:
 		return (pid);
@@ -568,6 +569,7 @@ mda_getlastline(int fd, char *dst, size_t dstsz)
 	char	*ln, buf[MAX_LINE_SIZE];
 	size_t	 len;
 
+	bzero(buf, sizeof buf);
 	if (lseek(fd, 0, SEEK_SET) < 0) {
 		log_warn("warn: mda: lseek");
 		close(fd);

@@ -1,6 +1,7 @@
 /*	$OpenBSD: smtpctl.c,v 1.95 2012/11/12 14:58:53 eric Exp $	*/
 
 /*
+ * Copyright (c) 2006 Gilles Chehade <gilles@poolp.org>
  * Copyright (c) 2006 Pierre-Yves Ritschard <pyr@openbsd.org>
  * Copyright (c) 2005 Claudio Jeker <claudio@openbsd.org>
  * Copyright (c) 2004, 2005 Esben Norby <norby@openbsd.org>
@@ -76,6 +77,7 @@ struct smtpd	*env = NULL;
 
 time_t now;
 
+struct queue_backend queue_backend_null;
 struct queue_backend queue_backend_ram;
 
 __dead void
@@ -95,8 +97,6 @@ usage(void)
 static void
 setup_env(struct smtpd *smtpd)
 {
-	struct passwd	*pwq;
-
 	bzero(smtpd, sizeof (*smtpd));
 	env = smtpd;
 
@@ -107,17 +107,13 @@ setup_env(struct smtpd *smtpd)
 
 	env->sc_pwqueue = getpwnam(SMTPD_QUEUE_USER);
 	if (env->sc_pwqueue)
-		pwq = env->sc_pwqueue = pw_dup(env->sc_pwqueue);
+		env->sc_pwqueue = pw_dup(env->sc_pwqueue);
 	else
-		pwq = env->sc_pwqueue = pw_dup(env->sc_pw);
+		env->sc_pwqueue = pw_dup(env->sc_pw);
 	if (env->sc_pwqueue == NULL)
 		err(1, NULL);
 
-	env->sc_queue = queue_backend_lookup("fs");
-	if (env->sc_queue == NULL)
-		errx(1, "could not find queue backend");
-
-	if (!env->sc_queue->init(0))
+	if (!queue_init("fs", 0))
 		errx(1, "invalid directory permissions");
 }
 
@@ -233,10 +229,8 @@ main(int argc, char *argv[])
 		/* not reached */
 
 	case SCHEDULE:
-		if (! strcmp(res->data, "all")) {
-			action_schedule_all();
-			return;
-		}
+		if (! strcmp(res->data, "all"))
+			return action_schedule_all();
 
 		if ((ulval = text_to_evpid(res->data)) == 0)
 			errx(1, "invalid msgid/evpid");
@@ -283,7 +277,6 @@ main(int argc, char *argv[])
 		done = 1;
 		break;
 	case MONITOR:
-		done = 1;
 		while (1) {
 			imsg_compose(ibuf, IMSG_DIGEST, 0, 0, -1, NULL, 0);
 			flush();
@@ -660,12 +653,12 @@ show_envelope(const char *s)
 	if ((evpid = text_to_evpid(s)) == 0)
 		errx(1, "invalid msgid/evpid");
 
-	if (! bsnprintf(buf, sizeof(buf), "%s%s/%02x/%08x%s/%016" PRIx64,
+	if (! bsnprintf(buf, sizeof(buf), "%s%s/%02x/%08x/%016" PRIx64,
 	    PATH_SPOOL,
 	    PATH_QUEUE,
 	    evpid_to_msgid(evpid) & 0xff,
 	    evpid_to_msgid(evpid),
-	    PATH_ENVELOPES, evpid))
+	    evpid))
 		errx(1, "unable to retrieve envelope");
 
 	display(buf);

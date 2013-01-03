@@ -1,7 +1,7 @@
 /*	$OpenBSD: smtpd.h,v 1.395 2012/11/12 14:58:53 eric Exp $	*/
 
 /*
- * Copyright (c) 2008 Gilles Chehade <gilles@openbsd.org>
+ * Copyright (c) 2008 Gilles Chehade <gilles@poolp.org>
  * Copyright (c) 2008 Pierre-Yves Ritschard <pyr@openbsd.org>
  * Copyright (c) 2012 Eric Faurot <eric@openbsd.org>
  *
@@ -30,7 +30,7 @@
 
 #define CONF_FILE		 "/etc/mail/smtpd.conf"
 #define MAX_LISTEN		 16
-#define PROC_COUNT		 9
+#define PROC_COUNT		 10
 #define MAX_NAME_SIZE		 64
 
 #define MAX_HOPS_COUNT		 100
@@ -64,10 +64,10 @@
 #define PATH_PURGE		"/purge"
 #define PATH_TEMPORARY		"/temporary"
 #define PATH_INCOMING		"/incoming"
-#define PATH_ENVELOPES		"/envelopes"
 #define PATH_MESSAGE		"/message"
 
 #define	PATH_FILTERS		"/usr/libexec/smtpd"
+
 
 /* number of MX records to lookup */
 #define MAX_MX_COUNT		10
@@ -83,12 +83,12 @@
 
 #define F_STARTTLS		0x01
 #define F_SMTPS			0x02
-#define F_AUTH			0x04
-#define F_SSL		       (F_SMTPS|F_STARTTLS)
-#define	F_STARTTLS_REQUIRE	0x08
-#define	F_AUTH_REQUIRE		0x10
-
-#define	F_BACKUP		0x20	/* XXX - MUST BE SYNC-ED WITH RELAY_BACKUP */
+#define	F_TLS_OPTIONAL		0x04
+#define F_SSL		       (F_STARTTLS | F_SMTPS)
+#define F_AUTH			0x08
+#define	F_BACKUP		0x10	/* XXX - MUST BE SYNC-ED WITH RELAY_BACKUP */
+#define	F_STARTTLS_REQUIRE	0x20
+#define	F_AUTH_REQUIRE		0x40
 
 #define F_SCERT			0x01
 #define F_CCERT			0x02
@@ -96,10 +96,11 @@
 /* must match F_* for mta */
 #define RELAY_STARTTLS		0x01
 #define RELAY_SMTPS		0x02
+#define	RELAY_TLS_OPTIONAL     	0x04
 #define RELAY_SSL		(RELAY_STARTTLS | RELAY_SMTPS)
-#define RELAY_AUTH		0x04
-#define RELAY_MX		0x08
-#define RELAY_BACKUP		0x20	/* XXX - MUST BE SYNC-ED WITH F_BACKUP */
+#define RELAY_AUTH		0x08
+#define RELAY_BACKUP		0x10	/* XXX - MUST BE SYNC-ED WITH F_BACKUP */
+#define RELAY_MX		0x20
 
 typedef uint32_t	objid_t;
 
@@ -182,6 +183,10 @@ enum imsg_type {
 	IMSG_LKA_SOURCE,
 	IMSG_LKA_USERINFO,
 	IMSG_LKA_AUTHENTICATE,
+	IMSG_LKA_SSL_INIT,
+	IMSG_LKA_SSL_VERIFY_CERT,
+	IMSG_LKA_SSL_VERIFY_CHAIN,
+	IMSG_LKA_SSL_VERIFY,
 
 	IMSG_DELIVERY_OK,
 	IMSG_DELIVERY_TEMPFAIL,
@@ -201,6 +206,7 @@ enum imsg_type {
 	IMSG_MFA_REQ_EOM,
 	IMSG_MFA_EVENT_RSET,
 	IMSG_MFA_EVENT_COMMIT,
+	IMSG_MFA_EVENT_ROLLBACK,
 	IMSG_MFA_EVENT_DISCONNECT,
 	IMSG_MFA_SMTP_DATA,
 	IMSG_MFA_SMTP_RESPONSE,
@@ -214,6 +220,7 @@ enum imsg_type {
 	IMSG_QUEUE_COMMIT_ENVELOPES,
 	IMSG_QUEUE_REMOVE_MESSAGE,
 	IMSG_QUEUE_COMMIT_MESSAGE,
+	IMSG_QUEUE_DATA,
 	IMSG_QUEUE_MESSAGE_FD,
 	IMSG_QUEUE_MESSAGE_FILE,
 	IMSG_QUEUE_REMOVE,
@@ -409,6 +416,7 @@ struct expand {
 	RB_HEAD(expandtree, expandnode)	 tree;
 	TAILQ_HEAD(xnodes, expandnode)	*queue;
 	int				 alias;
+	size_t				 nb_nodes;
 	struct rule			*rule;
 	struct expandnode		*parent;
 };
@@ -492,7 +500,6 @@ enum envelope_field {
 };
 
 struct ssl {
-	SPLAY_ENTRY(ssl)	 ssl_nodes;
 	char			 ssl_name[PATH_MAX];
 	char			*ssl_ca;
 	off_t			 ssl_ca_len;
@@ -532,6 +539,8 @@ struct smtpd {
 	char				sc_conffile[MAXPATHLEN];
 	size_t				sc_maxsize;
 
+	pid_t				sc_pid;
+
 #define SMTPD_OPT_VERBOSE		0x00000001
 #define SMTPD_OPT_NOACTION		0x00000002
 	uint32_t			sc_opts;
@@ -556,8 +565,6 @@ struct smtpd {
 	struct passwd		       *sc_pw;
 	struct passwd		       *sc_pwqueue;
 	char				sc_hostname[MAXHOSTNAMELEN];
-	struct queue_backend	       *sc_queue;
-	struct compress_backend	       *sc_compress;
 	struct scheduler_backend       *sc_scheduler;
 	struct stat_backend	       *sc_stat;
 
@@ -566,7 +573,8 @@ struct smtpd {
 	TAILQ_HEAD(listenerlist, listener)	*sc_listeners;
 
 	TAILQ_HEAD(rulelist, rule)		*sc_rules, *sc_rules_reload;
-	SPLAY_HEAD(ssltree, ssl)		*sc_ssl;
+	
+	struct dict			       *sc_ssl_dict;
 
 	struct dict			       *sc_tables_dict;		/* keyed lookup	*/
 	struct tree			       *sc_tables_tree;		/* id lookup	*/
@@ -579,12 +587,16 @@ struct smtpd {
 #define	TRACE_IMSG	0x0002
 #define	TRACE_IO	0x0004
 #define	TRACE_SMTP	0x0008
-#define	TRACE_MTA	0x0010
-#define	TRACE_BOUNCE	0x0020
-#define	TRACE_SCHEDULER	0x0040
-#define	TRACE_STAT	0x0080
-#define	TRACE_PROFILING	0x0100
+#define	TRACE_MFA	0x0010
+#define	TRACE_MTA	0x0020
+#define	TRACE_BOUNCE	0x0040
+#define	TRACE_SCHEDULER	0x0080
+#define	TRACE_STAT	0x0100
 #define	TRACE_RULES	0x0200
+
+#define PROFILE_TOSTAT	0x0001
+#define PROFILE_IMSG	0x0002
+#define PROFILE_QUEUE	0x0004
 
 struct forward_req {
 	uint64_t			id;
@@ -680,7 +692,6 @@ struct mta_relay {
 	char			*cert;
 	char			*authtable;
 	char			*authlabel;
-	void			*ssl;
 
 	char			*secret;
 
@@ -723,6 +734,7 @@ enum queue_op {
 	QOP_WALK,
 	QOP_COMMIT,
 	QOP_LOAD,
+	QOP_FD_RW,
 	QOP_FD_R,
 	QOP_CORRUPT,
 };
@@ -734,10 +746,12 @@ struct queue_backend {
 };
 
 struct compress_backend {
-	int	(*compress_file)(FILE *, FILE *);
-	int	(*uncompress_file)(FILE *, FILE *);
-	size_t	(*compress_buffer)(char *, size_t, char *, size_t);
-	size_t	(*uncompress_buffer)(char *, size_t, char *, size_t);
+	void *	(*compress_new)(void);
+	size_t	(*compress_chunk)(void *, void *, size_t, void *, size_t);
+	size_t	(*compress_finalize)(void *, void *, size_t);
+	void *	(*uncompress_new)(void);
+	size_t	(*uncompress_chunk)(void *, void *, size_t, void *, size_t);
+	size_t	(*uncompress_finalize)(void *, void *, size_t);
 };
 
 /* auth structures */
@@ -868,8 +882,9 @@ struct stat_digest {
 };
 
 struct mproc {
-	int		 proc; /* remove later */
+	pid_t		 pid;
 	char		*name;
+	int		 proc;
 	void		(*handler)(struct mproc *, struct imsg *);
 	struct imsgbuf	 imsgbuf;
 	struct ibuf	*ibuf;
@@ -917,44 +932,47 @@ struct queue_req_msg {
 	uint64_t	evpid;
 };
 
+struct queue_data_msg {
+	uint32_t	msgid;
+	size_t		len;
+	char		data[MAX_LINE_SIZE];
+};
+
 struct queue_resp_msg {
 	uint64_t	reqid;
 	int		success;
 	uint64_t	evpid;
 };
 
-
 struct mfa_connect_msg {
 	uint64_t		reqid;
+	int			flags;
 	struct sockaddr_storage	local;
-	struct sockaddr_storage	peer;
+	struct sockaddr_storage	remote;
 	char			hostname[MAXHOSTNAMELEN];
 };
 
-struct mfa_helo_msg {
+struct mfa_line_msg {
 	uint64_t		reqid;
 	int			flags;
-	char			helo[MAX_LINE_SIZE];
+	char			line[MAX_LINE_SIZE];
 };
 
-struct mfa_mail_msg {
+struct mfa_maddr_msg {
 	uint64_t		reqid;
 	int			flags;
-	struct mailaddr		sender;
-};
-
-struct mfa_rcpt_msg {
-	uint64_t		reqid;
-	struct mailaddr		rcpt;
+	struct mailaddr		maddr;
 };
 
 struct mfa_data_msg {
 	uint64_t		reqid;
+	int			flags;
 	char			buffer[MAX_LINE_SIZE];
 };
 
 struct mfa_req_msg {
 	uint64_t		reqid;
+	int			flags;
 };
 
 enum mfa_resp_status {
@@ -1043,6 +1061,40 @@ struct lka_userinfo_resp_msg {
 	struct userinfo		userinfo;
 };
 
+enum ca_resp_status {
+	CA_OK,
+	CA_FAIL
+};
+
+struct ca_cert_req_msg {
+	uint64_t		reqid;
+	char			name[MAXPATHLEN];
+};
+
+struct ca_cert_resp_msg {
+	uint64_t		reqid;
+	enum ca_resp_status	status;
+	char		       *cert;
+	off_t			cert_len;
+	char		       *key;
+	off_t			key_len;
+};
+
+struct ca_vrfy_req_msg {
+	uint64_t		reqid;
+	unsigned char  	       *cert;
+	off_t			cert_len;
+	size_t			n_chain;
+	size_t			chain_offset;
+	unsigned char	      **chain_cert;
+	off_t		       *chain_cert_len;
+};
+
+struct ca_vrfy_resp_msg {
+	uint64_t		reqid;
+	enum ca_resp_status	status;
+};
+
 
 /* aliases.c */
 int aliases_get(struct table *, struct expand *, const char *);
@@ -1060,13 +1112,21 @@ void bounce_add(uint64_t);
 void bounce_run(uint64_t, int);
 
 
-/* compress_backend.c */
-struct compress_backend *compress_backend_lookup(const char *);
-int compress_file(FILE *, FILE *);
-int uncompress_file(FILE *, FILE *);
-size_t compress_buffer(char *, size_t, char *, size_t);
-size_t uncompress_buffer(char *, size_t, char *, size_t);
+/* ca.c */
+int	ca_X509_verify(void *, void *, const char *, const char *, const char **);
 
+
+/* compress_backend.c */
+int	compress_backend_init(const char *);
+void*	compress_new(void);
+size_t	compress_chunk(void *, void *, size_t, void *, size_t);
+size_t	compress_finalize(void *, void *, size_t);
+size_t	compress_buffer(char *, size_t, char *, size_t);
+void*	uncompress_new(void);
+size_t	uncompress_chunk(void *, void *, size_t, void *, size_t);
+size_t	uncompress_finalize(void *, void *, size_t);
+size_t	uncompress_buffer(char *, size_t, char *, size_t);
+int	uncompress_file(FILE *, FILE *);
 
 /* config.c */
 #define PURGE_LISTENERS		0x01
@@ -1115,7 +1175,7 @@ int expand_cmp(struct expandnode *, struct expandnode *);
 void expand_insert(struct expand *, struct expandnode *);
 struct expandnode *expand_lookup(struct expand *, struct expandnode *);
 void expand_free(struct expand *);
-int expand_line(struct expand *, const char *);
+int expand_line(struct expand *, const char *, int);
 RB_PROTOTYPE(expandtree, expandnode, nodes, expand_cmp);
 
 
@@ -1148,9 +1208,20 @@ pid_t mda(void);
 
 /* mfa.c */
 pid_t mfa(void);
+void mfa_ready(void);
 
+/* mfa_session.c */
+void mfa_filter_init(void);
+void mfa_filter_connect(uint64_t, const struct sockaddr *,
+    const struct sockaddr *, const char *);
+void mfa_filter_mailaddr(uint64_t, int, const struct mailaddr *);
+void mfa_filter_line(uint64_t, int, const char *);
+void mfa_filter(uint64_t, int);
+void mfa_filter_event(uint64_t, int);
+void mfa_filter_data(uint64_t, const char *);
 
 /* mproc.c */
+int mproc_fork(struct mproc *, const char*, const char *);
 void mproc_init(struct mproc *, int);
 void mproc_clear(struct mproc *);
 void mproc_enable(struct mproc *);
@@ -1190,11 +1261,9 @@ pid_t queue(void);
 
 /* queue_backend.c */
 uint32_t queue_generate_msgid(void);
-uint64_t queue_generate_evpid(uint32_t msgid);
-struct queue_backend *queue_backend_lookup(const char *);
+uint64_t queue_generate_evpid(uint32_t);
+int queue_init(const char *, int);
 int queue_message_incoming_path(uint32_t, char *, size_t);
-int queue_envelope_incoming_path(uint64_t, char *, size_t);
-int queue_message_incoming_delete(uint32_t);
 int queue_message_create(uint32_t *);
 int queue_message_delete(uint32_t);
 int queue_message_commit(uint32_t);
@@ -1243,11 +1312,10 @@ const char * imsg_to_str(int);
 void ssl_init(void);
 int ssl_load_certfile(const char *, uint8_t);
 void ssl_setup(struct listener *);
-void *ssl_smtp_init(void *);
-void *ssl_mta_init(struct ssl *);
+void *ssl_mta_init(char *, off_t, char *, off_t);
+void *ssl_smtp_init(void *, char *, off_t, char *, off_t);
 const char *ssl_to_text(void *);
 int ssl_cmp(struct ssl *, struct ssl *);
-SPLAY_PROTOTYPE(ssltree, ssl, ssl_nodes, ssl_cmp);
 
 
 /* ssl_privsep.c */
@@ -1350,6 +1418,7 @@ void *xmalloc(size_t, const char *);
 void *xcalloc(size_t, size_t, const char *);
 char *xstrdup(const char *, const char *);
 void *xmemdup(const void *, size_t, const char *);
+char *strip(char *);
 void iobuf_xinit(struct iobuf *, size_t, size_t, const char *);
 void iobuf_xfqueue(struct iobuf *, const char *, const char *, ...);
 void log_envelope(const struct envelope *, const char *, const char *,

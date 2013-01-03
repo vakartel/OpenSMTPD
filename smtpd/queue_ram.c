@@ -57,6 +57,7 @@ struct qr_envelope {
 };
 
 struct qr_message {
+	int		 hasfile;
 	char		*buf;
 	size_t		 len;
 	struct tree	 envelopes;
@@ -90,11 +91,6 @@ queue_ram_message(enum queue_op qop, uint32_t *msgid)
 		do {
 			*msgid = queue_generate_msgid();
 		} while (tree_check(&messages, *msgid));
-		queue_message_incoming_path(*msgid, path, sizeof(path));
-		if (mkdir(path, 0700) == -1) {
-			log_warn("queue_ram_message: mkdir");
-			return (0);
-		}
 		tree_xset(&messages, *msgid, msg);
 		return (1);
 
@@ -109,6 +105,11 @@ queue_ram_message(enum queue_op qop, uint32_t *msgid)
 		}
 		stat_decrement("queue.ram.message.size", msg->len);
 		free(msg->buf);
+		if (msg->hasfile) {
+			queue_message_incoming_path(*msgid, path, sizeof(path));
+			unlink(path);
+		}
+		free(msg);
 		return (1);
 
 	case QOP_COMMIT:
@@ -116,7 +117,6 @@ queue_ram_message(enum queue_op qop, uint32_t *msgid)
 		if (msg == NULL)
 			return (0);
 		queue_message_incoming_path(*msgid, path, sizeof(path));
-		strlcat(path, PATH_MESSAGE, sizeof(path));
 		if (stat(path, &sb) == -1) {
 			log_warn("queue_ram_message: stat");
 			return (0);
@@ -131,9 +131,8 @@ queue_ram_message(enum queue_op qop, uint32_t *msgid)
 		fread(msg->buf, 1, msg->len, f);
 		fclose(f);
 		unlink(path);
-		queue_message_incoming_path(*msgid, path, sizeof(path));
-		unlink(path);
 		stat_increment("queue.ram.message.size", msg->len);
+		msg->hasfile = 0;
 		return (1);
 
 	case QOP_FD_R:
@@ -146,6 +145,14 @@ queue_ram_message(enum queue_op qop, uint32_t *msgid)
 		write(fd, msg->buf, msg->len);
 		lseek(fd, 0, SEEK_SET);
 		return (fd);
+
+	case QOP_FD_RW:
+		msg = tree_get(&messages, *msgid);
+		if (msg == NULL)
+			return (0);
+		queue_message_incoming_path(*msgid, path, sizeof(path));
+		msg->hasfile = 1;
+		return (open(path, O_RDWR | O_CREAT | O_EXCL, 0600));
 
 	case QOP_CORRUPT:
 		return (queue_ram_message(QOP_DELETE, msgid));

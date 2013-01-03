@@ -3,7 +3,7 @@
 /*
  * Copyright (c) 2009 Jacek Masiulaniec <jacekm@dobremiasto.net>
  * Copyright (c) 2012 Eric Faurot <eric@openbsd.org>
- * Copyright (c) 2012 Gilles Chehade <gilles@openbsd.org>
+ * Copyright (c) 2012 Gilles Chehade <gilles@poolp.org>
  *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -306,6 +306,7 @@ text_to_relayhost(struct relayhost *relay, const char *s)
 		uint8_t		 flags;
 	} schemas [] = {
 		{ "smtp://",		0				},
+		{ "smtp+tls://",       	F_TLS_OPTIONAL 			},
 		{ "smtps://",		F_SMTPS				},
 		{ "tls://",		F_STARTTLS			},
 		{ "smtps+auth://",	F_SMTPS|F_AUTH			},
@@ -335,8 +336,8 @@ text_to_relayhost(struct relayhost *relay, const char *s)
 		if (strstr(buffer, "://"))
 			return 0;
 
-		/* no schema, default to smtp:// */
-		i = 0;
+		/* no schema, default to smtp+tls:// */
+		i = 1;
 		p = buffer;
 	}
 	else
@@ -406,6 +407,9 @@ relayhost_to_text(struct relayhost *relay)
 		break;
 	case F_BACKUP:
 		strlcat(buf, "backup://", sizeof buf);
+		break;
+	case F_TLS_OPTIONAL:
+		strlcat(buf, "smtp+tls://", sizeof buf);
 		break;
 	default:
 		strlcat(buf, "smtp://", sizeof buf);
@@ -628,28 +632,14 @@ text_to_credentials(struct credentials *creds, const char *s)
 int
 text_to_expandnode(struct expandnode *expandnode, const char *s)
 {
-	char	buffer[MAX_LINE_SIZE];
 	size_t	l;
-	char   *wsp;
 
-	bzero(buffer, sizeof buffer);
-	if (strlcpy(buffer, s, sizeof buffer) >= sizeof buffer)
-		return 0;
-
-	/* remove ending whitespaces */
-	wsp = buffer + strlen(buffer);
-	while (wsp != buffer) {
-		if (*wsp != '\0' && !isspace((int)*wsp))
-			break;
-		*wsp-- = '\0';
-	}
-
-	l = strlen(buffer);
-	if (alias_is_include(expandnode, buffer, l) ||
-	    alias_is_filter(expandnode, buffer, l) ||
-	    alias_is_filename(expandnode, buffer, l) ||
-	    alias_is_address(expandnode, buffer, l) ||
-	    alias_is_username(expandnode, buffer, l))
+	l = strlen(s);
+	if (alias_is_include(expandnode, s, l) ||
+	    alias_is_filter(expandnode, s, l) ||
+	    alias_is_filename(expandnode, s, l) ||
+	    alias_is_address(expandnode, s, l) ||
+	    alias_is_username(expandnode, s, l))
 		return (1);
 
 	return (0);

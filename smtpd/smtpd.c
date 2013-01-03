@@ -1,7 +1,7 @@
 /*	$OpenBSD: smtpd.c,v 1.181 2012/11/12 14:58:53 eric Exp $	*/
 
 /*
- * Copyright (c) 2008 Gilles Chehade <gilles@openbsd.org>
+ * Copyright (c) 2008 Gilles Chehade <gilles@poolp.org>
  * Copyright (c) 2008 Pierre-Yves Ritschard <pyr@openbsd.org>
  * Copyright (c) 2009 Jacek Masiulaniec <jacekm@dobremiasto.net>
  *
@@ -52,9 +52,9 @@ static void parent_imsg(struct mproc *, struct imsg *);
 static void usage(void);
 static void parent_shutdown(void);
 static void parent_send_config(int, short, void *);
-static void parent_send_config_listeners(void);
-static void parent_send_config_client_certs(void);
-static void parent_send_config_ruleset(struct mproc *);
+static void parent_send_config_lka(void);
+static void parent_send_config_mfa(void);
+static void parent_send_config_smtp(void);
 static void parent_sig_handler(int, short, void *);
 static void forkmda(struct mproc *, uint32_t, struct deliver *);
 static int parent_forward_open(char *, char *, uid_t, gid_t);
@@ -122,8 +122,7 @@ const char	*backend_queue = "fs";
 const char	*backend_scheduler = "ramqueue";
 const char	*backend_stat = "ram";
 
-static int	 profiling;
-static int	 profstat;
+int		 profiling = 0;
 
 struct tree	 children;
 
@@ -140,7 +139,7 @@ parent_imsg(struct mproc *p, struct imsg *imsg)
 	if (p->proc == PROC_SMTP) {
 		switch (imsg->hdr.type) {
 		case IMSG_PARENT_SEND_CONFIG:
-			parent_send_config_listeners();
+			parent_send_config_smtp();
 			return;
 		}
 	}
@@ -163,9 +162,13 @@ parent_imsg(struct mproc *p, struct imsg *imsg)
 			return;
 
 		case IMSG_LKA_AUTHENTICATE:
-			/* If we reached here, it means we want root to lookup system user */
+			/*
+			 * If we reached here, it means we want root to lookup
+			 * system user
+			 */
 			auth = imsg->data;
-			auth->success = parent_auth_user(auth->user, auth->pass);
+			auth->success = parent_auth_user(auth->user,
+			    auth->pass);
 			m_compose(p, IMSG_LKA_AUTHENTICATE, 0, 0, -1,
 			    auth, sizeof *auth);
 			return;
@@ -259,27 +262,26 @@ parent_shutdown(void)
 static void
 parent_send_config(int fd, short event, void *p)
 {
-	parent_send_config_listeners();
-	parent_send_config_client_certs();
-	parent_send_config_ruleset(p_mfa);
-	parent_send_config_ruleset(p_lka);
+	parent_send_config_lka();
+	parent_send_config_mfa();
+	parent_send_config_smtp();
 }
 
 static void
-parent_send_config_listeners(void)
+parent_send_config_smtp(void)
 {
 	struct listener		*l;
 	struct ssl		*s;
+	void			*iter = NULL;
 	struct iovec		 iov[5];
 	int			 opt;
 
 	log_debug("debug: parent_send_config: configuring smtp");
 	m_compose(p_smtp, IMSG_CONF_START, 0, 0, -1, NULL, 0);
 
-	SPLAY_FOREACH(s, ssltree, env->sc_ssl) {
+	while (dict_iter(env->sc_ssl_dict, &iter, NULL, (void **)&s)) {
 		if (!(s->flags & F_SCERT))
 			continue;
-
 		iov[0].iov_base = s;
 		iov[0].iov_len = sizeof(*s);
 		iov[1].iov_base = s->ssl_cert;
@@ -309,101 +311,102 @@ parent_send_config_listeners(void)
 	m_compose(p_smtp, IMSG_CONF_END, 0, 0, -1, NULL, 0);
 }
 
-static void
-parent_send_config_client_certs(void)
+void
+parent_send_config_mfa()
 {
-	struct ssl		*s;
-	struct iovec		 iov[3];
+	struct filter	       *f;
+	void		       *iter_dict = NULL;
 
-	log_debug("debug: parent_send_config_client_certs: configuring smtp");
-	m_compose(p_mta, IMSG_CONF_START, 0, 0, -1, NULL, 0);
+	log_debug("debug: parent_send_config_mfa: reloading");
+	m_compose(p_mfa, IMSG_CONF_START, 0, 0, -1, NULL, 0);
 
-	SPLAY_FOREACH(s, ssltree, env->sc_ssl) {
-		if (!(s->flags & F_CCERT))
-			continue;
+	while (dict_iter(&env->sc_filters, &iter_dict, NULL, (void **)&f))
+		m_compose(p_mfa, IMSG_CONF_FILTER, 0, 0, -1, f, sizeof(*f));
 
-		iov[0].iov_base = s;
-		iov[0].iov_len = sizeof(*s);
-		iov[1].iov_base = s->ssl_cert;
-		iov[1].iov_len = s->ssl_cert_len;
-		iov[2].iov_base = s->ssl_key;
-		iov[2].iov_len = s->ssl_key_len;
-		m_composev(p_mta, IMSG_CONF_SSL, 0, 0, -1, iov, nitems(iov));
-	}
-
-	m_compose(p_mta, IMSG_CONF_END, 0, 0, -1, NULL, 0);
+	m_compose(p_mfa, IMSG_CONF_END, 0, 0, -1, NULL, 0);
 }
 
 void
-parent_send_config_ruleset(struct mproc *p)
+parent_send_config_lka()
 {
 	struct rule	       *r;
 	struct table	       *t;
-	struct filter	       *f;
 	void		       *iter_tree;
 	void		       *iter_dict;
 	const char	       *k;
 	char		       *v;
 	char		       *buffer;
 	size_t			buflen;
+	struct ssl	       *s;
+	struct iovec		iov[5];
 
 	log_debug("debug: parent_send_config_ruleset: reloading");
-	m_compose(p, IMSG_CONF_START, 0, 0, -1, NULL, 0);
+	m_compose(p_lka, IMSG_CONF_START, 0, 0, -1, NULL, 0);
 
-	if (p->proc == PROC_MFA) {
+	iter_dict = NULL;
+	while (dict_iter(env->sc_ssl_dict, &iter_dict, NULL, (void **)&s)) {
+		if (!(s->flags & F_SCERT))
+			continue;
+		iov[0].iov_base = s;
+		iov[0].iov_len = sizeof(*s);
+		iov[1].iov_base = s->ssl_cert;
+		iov[1].iov_len = s->ssl_cert_len;
+		iov[2].iov_base = s->ssl_key;
+		iov[2].iov_len = s->ssl_key_len;
+		iov[3].iov_base = s->ssl_dhparams;
+		iov[3].iov_len = s->ssl_dhparams_len;
+		iov[4].iov_base = s->ssl_ca;
+		iov[4].iov_len = s->ssl_ca_len;
+		m_composev(p_lka, IMSG_CONF_SSL, 0, 0, -1, iov, nitems(iov));
+	}
+
+	iter_tree = NULL;
+	while (tree_iter(env->sc_tables_tree, &iter_tree, NULL,
+		(void **)&t)) {
+		m_compose(p_lka, IMSG_CONF_TABLE, 0, 0, -1, t, sizeof(*t));
+
 		iter_dict = NULL;
-		while (dict_iter(&env->sc_filters, &iter_dict, NULL, (void **)&f))
-			m_compose(p, IMSG_CONF_FILTER, 0, 0, -1, f, sizeof(*f));
-	}
-	else {
-		iter_tree = NULL;
-		while (tree_iter(env->sc_tables_tree, &iter_tree, NULL,
-		    (void **)&t)) {
-			m_compose(p, IMSG_CONF_TABLE, 0, 0, -1, t, sizeof(*t));
-
-			iter_dict = NULL;
-			while (dict_iter(&t->t_dict, &iter_dict, &k,
-			    (void **)&v)) {
-				buflen = strlen(k) + 1;
-				if (v)
-					buflen += strlen(v) + 1;
-				buffer = xcalloc(1, buflen,
-				    "parent_send_config_ruleset");
-				memcpy(buffer, k, strlen(k) + 1);
-				if (v)
-					memcpy(buffer + strlen(k) + 1, v,
-					    strlen(v) + 1);
-				m_compose(p, IMSG_CONF_TABLE_CONTENT, 0, 0, -1,
-				    buffer, buflen);
-				free(buffer);
-			}
-		}
-
-		TAILQ_FOREACH(r, env->sc_rules, r_entry) {
-			m_compose(p, IMSG_CONF_RULE, 0, 0, -1, r, sizeof(*r));
-			m_compose(p, IMSG_CONF_RULE_SOURCE, 0, 0, -1,
-			    &r->r_sources->t_name,
-			    sizeof(r->r_sources->t_name));
-			if (r->r_destination) {
-				m_compose(p, IMSG_CONF_RULE_DESTINATION,
-				    0, 0, -1,
-				    &r->r_destination->t_name,
-				    sizeof(r->r_destination->t_name));
-			}
-			if (r->r_mapping) {
-				m_compose(p, IMSG_CONF_RULE_MAPPING, 0, 0, -1,
-				    &r->r_mapping->t_name,
-				    sizeof(r->r_mapping->t_name));
-			}
-			if (r->r_users) {
-				m_compose(p, IMSG_CONF_RULE_USERS, 0, 0, -1,
-				    &r->r_users->t_name,
-				    sizeof(r->r_users->t_name));
-			}
+		while (dict_iter(&t->t_dict, &iter_dict, &k,
+			(void **)&v)) {
+			buflen = strlen(k) + 1;
+			if (v)
+				buflen += strlen(v) + 1;
+			buffer = xcalloc(1, buflen,
+			    "parent_send_config_ruleset");
+			memcpy(buffer, k, strlen(k) + 1);
+			if (v)
+				memcpy(buffer + strlen(k) + 1, v,
+				    strlen(v) + 1);
+			m_compose(p_lka, IMSG_CONF_TABLE_CONTENT, 0, 0, -1,
+			    buffer, buflen);
+			free(buffer);
 		}
 	}
 
-	m_compose(p, IMSG_CONF_END, 0, 0, -1, NULL, 0);
+	TAILQ_FOREACH(r, env->sc_rules, r_entry) {
+		m_compose(p_lka, IMSG_CONF_RULE, 0, 0, -1, r, sizeof(*r));
+		m_compose(p_lka, IMSG_CONF_RULE_SOURCE, 0, 0, -1,
+		    &r->r_sources->t_name,
+		    sizeof(r->r_sources->t_name));
+		if (r->r_destination) {
+			m_compose(p_lka, IMSG_CONF_RULE_DESTINATION,
+			    0, 0, -1,
+			    &r->r_destination->t_name,
+			    sizeof(r->r_destination->t_name));
+		}
+		if (r->r_mapping) {
+			m_compose(p_lka, IMSG_CONF_RULE_MAPPING, 0, 0, -1,
+			    &r->r_mapping->t_name,
+			    sizeof(r->r_mapping->t_name));
+		}
+		if (r->r_users) {
+			m_compose(p_lka, IMSG_CONF_RULE_USERS, 0, 0, -1,
+			    &r->r_users->t_name,
+			    sizeof(r->r_users->t_name));
+		}
+	}
+
+	m_compose(p_lka, IMSG_CONF_END, 0, 0, -1, NULL, 0);
 }
 
 static void
@@ -568,6 +571,8 @@ main(int argc, char *argv[])
 				verbose |= TRACE_IO;
 			else if (!strcmp(optarg, "smtp"))
 				verbose |= TRACE_SMTP;
+			else if (!strcmp(optarg, "mfa"))
+				verbose |= TRACE_MFA;
 			else if (!strcmp(optarg, "mta"))
 				verbose |= TRACE_MTA;
 			else if (!strcmp(optarg, "bounce"))
@@ -576,16 +581,16 @@ main(int argc, char *argv[])
 				verbose |= TRACE_SCHEDULER;
 			else if (!strcmp(optarg, "stat"))
 				verbose |= TRACE_STAT;
-			else if (!strcmp(optarg, "profiling")) {
-				verbose |= TRACE_PROFILING;
-				profiling = 1;
-			}
-			else if (!strcmp(optarg, "profstat"))
-				profstat = 1;
 			else if (!strcmp(optarg, "rules"))
 				verbose |= TRACE_RULES;
 			else if (!strcmp(optarg, "all"))
 				verbose |= ~TRACE_VERBOSE;
+			else if (!strcmp(optarg, "profstat"))
+				profiling |= PROFILE_TOSTAT;
+			else if (!strcmp(optarg, "profile-imsg"))
+				profiling |= PROFILE_IMSG;
+			else if (!strcmp(optarg, "profile-queue"))
+				profiling |= PROFILE_QUEUE;
 			else
 				log_warnx("warn: unknown trace flag \"%s\"",
 				    optarg);
@@ -653,35 +658,27 @@ main(int argc, char *argv[])
 		errx(1, "error in offline directory setup");
 	if (ckdir(PATH_SPOOL PATH_PURGE, 0700, pwq->pw_uid, 0, 1) == 0)
 		errx(1, "error in purge directory setup");
-	if (ckdir(PATH_SPOOL PATH_TEMPORARY, 0700, pwq->pw_uid, 0, 1)
-	    == 0)
+	if (ckdir(PATH_SPOOL PATH_TEMPORARY, 0700, pwq->pw_uid, 0, 1) == 0)
 		errx(1, "error in purge directory setup");
 
 	mvpurge(PATH_SPOOL PATH_INCOMING, PATH_SPOOL PATH_PURGE);
 
-	if (ckdir(PATH_SPOOL PATH_INCOMING, 0700, pwq->pw_uid, 0, 1)
-	    == 0)
+	if (ckdir(PATH_SPOOL PATH_INCOMING, 0700, pwq->pw_uid, 0, 1) == 0)
 		errx(1, "error in incoming directory setup");
 
-	env->sc_queue = queue_backend_lookup(backend_queue);
-	if (env->sc_queue == NULL)
-		errx(1, "could not find queue backend \"%s\"", backend_queue);
-
-	if (!env->sc_queue->init(1))
+	if (!queue_init(backend_queue, 1))
 		errx(1, "could not initialize queue backend");
 
 	env->sc_stat = stat_backend_lookup(backend_stat);
 	if (env->sc_stat == NULL)
 		errx(1, "could not find stat backend \"%s\"", backend_stat);
 
-	if (env->sc_queue_compress_algo) {
-		env->sc_compress =
-			compress_backend_lookup(env->sc_queue_compress_algo);
-		if (env->sc_compress == NULL)
-			errx(1, "could not find queue compress backend \"%s\"",
-			    env->sc_queue_compress_algo);
-	}
-
+	/*
+	if (env->sc_queue_compress_algo &&
+	    !compress_backend_init(env->sc_queue_compress_algo));
+		errx(1, "could setup queue compress backend \"%s\"",
+		    env->sc_queue_compress_algo);
+	*/
 	log_init(debug);
 	log_verbose(verbose);
 
@@ -709,7 +706,8 @@ main(int argc, char *argv[])
 	TAILQ_FOREACH(l, env->sc_listeners, entry) {
 		if (l->flags & F_SSL) {
 			if (ssl_load_certfile(l->ssl_cert_name, F_SCERT) < 0)
-				errx(1, "cannot load certificate: %s", l->ssl_cert_name);
+				errx(1, "cannot load certificate: %s",
+				    l->ssl_cert_name);
 		}
 	}
 
@@ -720,9 +718,10 @@ main(int argc, char *argv[])
 		if (! r->r_value.relayhost.cert[0])
 			continue;
 		if (ssl_load_certfile(r->r_value.relayhost.cert, F_CCERT) < 0)
-			errx(1, "cannot load certificate: %s", r->r_value.relayhost.cert);
+			errx(1, "cannot load certificate: %s",
+			    r->r_value.relayhost.cert);
 	}
-	
+
 	fork_peers();
 
 	smtpd_process = PROC_PARENT;
@@ -1206,23 +1205,23 @@ imsg_dispatch(struct mproc *p, struct imsg *imsg)
 
 	log_imsg(smtpd_process, p->proc, imsg);
 
-	if (profiling || profstat)
+	if (profiling & PROFILE_IMSG)
 		clock_gettime(CLOCK_MONOTONIC, &t0);
 
 	imsg_callback(p, imsg);
 
-	if (profiling || profstat) {
+	if (profiling & PROFILE_IMSG) {
 		clock_gettime(CLOCK_MONOTONIC, &t1);
 		timespecsub(&t1, &t0, &dt);
 
-		log_trace(TRACE_PROFILING, "PROFILE %s %s %s %li.%06li",
+		log_debug("profile-imsg: %s %s %s %li.%06li",
 		    proc_to_str(smtpd_process),
 		    proc_to_str(p->proc),
 		    imsg_to_str(imsg->hdr.type),
 		    dt.tv_sec * 1000000 + dt.tv_nsec / 1000000,
 		    dt.tv_nsec % 1000000);
 
-		if (profstat) {
+		if (profiling & PROFILE_TOSTAT) {
 			char	key[STAT_KEY_SIZE];
 			/* can't profstat control process yet */
 			if (smtpd_process == PROC_CONTROL)
@@ -1325,6 +1324,10 @@ imsg_to_str(int type)
 	CASE(IMSG_LKA_SOURCE);
 	CASE(IMSG_LKA_USERINFO);
 	CASE(IMSG_LKA_AUTHENTICATE);
+	CASE(IMSG_LKA_SSL_INIT);
+	CASE(IMSG_LKA_SSL_VERIFY_CERT);
+	CASE(IMSG_LKA_SSL_VERIFY_CHAIN);
+	CASE(IMSG_LKA_SSL_VERIFY);
 
 	CASE(IMSG_MDA_DELIVER);
 	CASE(IMSG_MDA_DONE);
@@ -1337,6 +1340,7 @@ imsg_to_str(int type)
 	CASE(IMSG_MFA_REQ_EOM);
 	CASE(IMSG_MFA_EVENT_RSET);
 	CASE(IMSG_MFA_EVENT_COMMIT);
+	CASE(IMSG_MFA_EVENT_ROLLBACK);
 	CASE(IMSG_MFA_EVENT_DISCONNECT);
 	CASE(IMSG_MFA_SMTP_DATA);
 	CASE(IMSG_MFA_SMTP_RESPONSE);
@@ -1350,6 +1354,7 @@ imsg_to_str(int type)
 	CASE(IMSG_QUEUE_COMMIT_ENVELOPES);
 	CASE(IMSG_QUEUE_REMOVE_MESSAGE);
 	CASE(IMSG_QUEUE_COMMIT_MESSAGE);
+	CASE(IMSG_QUEUE_DATA);
 	CASE(IMSG_QUEUE_MESSAGE_FD);
 	CASE(IMSG_QUEUE_MESSAGE_FILE);
 	CASE(IMSG_QUEUE_REMOVE);
@@ -1376,6 +1381,7 @@ imsg_to_str(int type)
 	CASE(IMSG_DIGEST);
 	CASE(IMSG_STATS);
 	CASE(IMSG_STATS_GET);
+
 	default:
 		snprintf(buf, sizeof(buf), "IMSG_??? (%d)", type);
 

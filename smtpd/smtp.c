@@ -1,7 +1,7 @@
 /*	$OpenBSD: smtp.c,v 1.121 2012/11/12 14:58:53 eric Exp $	*/
 
 /*
- * Copyright (c) 2008 Gilles Chehade <gilles@openbsd.org>
+ * Copyright (c) 2008 Gilles Chehade <gilles@poolp.org>
  * Copyright (c) 2008 Pierre-Yves Ritschard <pyr@openbsd.org>
  * Copyright (c) 2009 Jacek Masiulaniec <jacekm@dobremiasto.net>
  *
@@ -67,6 +67,12 @@ smtp_imsg(struct mproc *p, struct imsg *imsg)
 		case IMSG_LKA_AUTHENTICATE:
 			smtp_session_imsg(p, imsg);
 			return;
+		case IMSG_LKA_SSL_INIT:
+			smtp_session_imsg(p, imsg);
+			return;
+		case IMSG_LKA_SSL_VERIFY:
+			smtp_session_imsg(p, imsg);
+			return;
 		}
 	}
 
@@ -106,8 +112,10 @@ smtp_imsg(struct mproc *p, struct imsg *imsg)
 			env->sc_flags |= SMTPD_CONFIGURING;
 			env->sc_listeners = calloc(1,
 			    sizeof *env->sc_listeners);
-			env->sc_ssl = calloc(1, sizeof *env->sc_ssl);
-			if (env->sc_listeners == NULL || env->sc_ssl == NULL)
+			if (env->sc_listeners == NULL)
+				fatal(NULL);
+			env->sc_ssl_dict = calloc(1, sizeof *env->sc_ssl_dict);
+			if (env->sc_ssl_dict == NULL)
 				fatal(NULL);
 			TAILQ_INIT(env->sc_listeners);
 			return;
@@ -134,8 +142,7 @@ smtp_imsg(struct mproc *p, struct imsg *imsg)
 				    ssl->ssl_key_len + ssl->ssl_dhparams_len,
 				    "smtp:ssl_ca");
 			}
-
-			SPLAY_INSERT(ssltree, env->sc_ssl, ssl);
+			dict_set(env->sc_ssl_dict, ssl->ssl_name, ssl);
 			return;
 
 		case IMSG_CONF_LISTENER:
@@ -148,15 +155,11 @@ smtp_imsg(struct mproc *p, struct imsg *imsg)
 			l->fd = imsg->fd;
 			if (l->fd < 0)
 				fatalx("smtp: listener pass failed");
-			if (l->flags & F_SSL) {
-				struct ssl key;
-
-				strlcpy(key.ssl_name, l->ssl_cert_name,
-				    sizeof key.ssl_name);
-				l->ssl = SPLAY_FIND(ssltree, env->sc_ssl, &key);
-				if (l->ssl == NULL)
-					fatalx("smtp: ssltree out of sync");
-			}
+                        if (l->flags & F_SSL) {
+				l->ssl = dict_get(env->sc_ssl_dict, l->ssl_cert_name);
+                                if (l->ssl == NULL)
+                                        fatalx("smtp: ssltree out of sync");
+                        }
 			TAILQ_INSERT_TAIL(env->sc_listeners, l, entry);
 			return;
 
@@ -229,6 +232,7 @@ smtp(void)
 	case -1:
 		fatal("smtp: cannot fork");
 	case 0:
+		env->sc_pid = getpid();
 		break;
 	default:
 		return (pid);
@@ -295,8 +299,11 @@ smtp_setup_events(void)
 		if (!(env->sc_flags & SMTPD_SMTP_PAUSED))
 			event_add(&l->ev, NULL);
 
-		ssl_setup(l);
+		if (l->flags & F_SSL)
+			ssl_setup(l);
 	}
+
+	purge_config(PURGE_SSL);
 
 	log_debug("debug: smtp: will accept at most %d clients",
 	    (getdtablesize() - getdtablecount())/2 - SMTP_FD_RESERVE);
@@ -337,6 +344,7 @@ smtp_enqueue(uid_t *euid)
 		listener = &local;
 		strlcpy(listener->tag, "local", sizeof(listener->tag));
 		listener->ss.ss_family = AF_LOCAL;
+		listener->ss.ss_len = sizeof(struct sockaddr *);
 	}
 
 	/*

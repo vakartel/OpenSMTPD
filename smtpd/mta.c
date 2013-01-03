@@ -2,7 +2,7 @@
 
 /*
  * Copyright (c) 2008 Pierre-Yves Ritschard <pyr@openbsd.org>
- * Copyright (c) 2008 Gilles Chehade <gilles@openbsd.org>
+ * Copyright (c) 2008 Gilles Chehade <gilles@poolp.org>
  * Copyright (c) 2009 Jacek Masiulaniec <jacekm@dobremiasto.net>
  * Copyright (c) 2012 Eric Faurot <eric@openbsd.org>
  *
@@ -141,7 +141,6 @@ mta_imsg(struct mproc *p, struct imsg *imsg)
 	struct tree		*batch;
 	struct secret		*secret;
 	struct envelope		*e;
-	struct ssl		*ssl;
 	uint64_t		 id;
 
 	if (p->proc == PROC_QUEUE) {
@@ -311,36 +310,19 @@ mta_imsg(struct mproc *p, struct imsg *imsg)
 		case IMSG_DNS_PTR:
 			mta_session_imsg(p, imsg);
 			return;
+
+		case IMSG_LKA_SSL_INIT:
+			mta_session_imsg(p, imsg);
+			return;
+
+		case IMSG_LKA_SSL_VERIFY:
+			mta_session_imsg(p, imsg);
+			return;
 		}
 	}
 
 	if (p->proc == PROC_PARENT) {
 		switch (imsg->hdr.type) {
-		case IMSG_CONF_START:
-			if (env->sc_flags & SMTPD_CONFIGURING)
-				return;
-			env->sc_flags |= SMTPD_CONFIGURING;
-			env->sc_ssl = xcalloc(1, sizeof *env->sc_ssl,
-			    "mta:sc_ssl");
-			return;
-
-		case IMSG_CONF_SSL:
-			if (!(env->sc_flags & SMTPD_CONFIGURING))
-				return;
-			ssl = xmemdup(imsg->data, sizeof *ssl, "mta:ssl");
-			ssl->ssl_cert = xstrdup((char*)imsg->data + sizeof *ssl,
-			    "mta:ssl_cert");
-			ssl->ssl_key = xstrdup((char*)imsg->data +
-			    sizeof *ssl + ssl->ssl_cert_len, "mta:ssl_key");
-			SPLAY_INSERT(ssltree, env->sc_ssl, ssl);
-			return;
-
-		case IMSG_CONF_END:
-			if (!(env->sc_flags & SMTPD_CONFIGURING))
-				return;
-			env->sc_flags &= ~SMTPD_CONFIGURING;
-			return;
-
 		case IMSG_CTL_VERBOSE:
 			log_verbose(*(int *)imsg->data);
 			return;
@@ -382,6 +364,7 @@ mta(void)
 	case -1:
 		fatal("mta: cannot fork");
 	case 0:
+		env->sc_pid = getpid();
 		break;
 	default:
 		return (pid);
@@ -959,7 +942,6 @@ mta_find_route(struct mta_relay *relay, struct mta_source *source)
 static struct mta_relay *
 mta_relay(struct envelope *e)
 {
-	struct ssl		 ssl;
 	struct mta_relay	 key, *r;
 
 	bzero(&key, sizeof key);
@@ -1005,10 +987,6 @@ mta_relay(struct envelope *e)
 			r->authtable = xstrdup(key.authtable, "mta: authtable");
 		if (key.authlabel)
 			r->authlabel = xstrdup(key.authlabel, "mta: authlabel");
-		if (r->cert) {
-			strlcpy(ssl.ssl_name, r->cert, sizeof(ssl.ssl_name));
-			r->ssl = SPLAY_FIND(ssltree, env->sc_ssl, &ssl);
-		}
 		if (key.sourcetable)
 			r->sourcetable = xstrdup(key.sourcetable,
 			    "mta: sourcetable");

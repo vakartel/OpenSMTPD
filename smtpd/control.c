@@ -1,7 +1,7 @@
 /*	$OpenBSD: control.c,v 1.78 2012/11/12 14:58:53 eric Exp $	*/
 
 /*
- * Copyright (c) 2012 Gilles Chehade <gilles@openbsd.org>
+ * Copyright (c) 2012 Gilles Chehade <gilles@poolp.org>
  * Copyright (c) 2008 Pierre-Yves Ritschard <pyr@openbsd.org>
  * Copyright (c) 2003, 2004 Henning Brauer <henning@openbsd.org>
  *
@@ -172,6 +172,7 @@ control(void)
 	case -1:
 		fatal("control: cannot fork");
 	case 0:
+		env->sc_pid = getpid();
 		break;
 	default:
 		return (pid);
@@ -401,7 +402,6 @@ control_dispatch_ext(struct mproc *p, struct imsg *imsg)
 {
 	struct ctl_conn		*c;
 	int			 verbose;
-	uint64_t		 id;
 	struct stat_kv		*kvp;
 	char			*key;
 	struct stat_value	 val;
@@ -583,7 +583,6 @@ control_dispatch_ext(struct mproc *p, struct imsg *imsg)
 		if (c->euid)
 			goto badcred;
 
-		id = *(uint64_t *)imsg->data;
 		m_forward(p_scheduler, imsg);
 		m_compose(p, IMSG_CTL_OK, 0, 0, -1, NULL, 0);
 		return;
@@ -592,7 +591,6 @@ control_dispatch_ext(struct mproc *p, struct imsg *imsg)
 		if (c->euid)
 			goto badcred;
 
-		id = *(uint64_t *)imsg->data;
 		m_forward(p_scheduler, imsg);
 		m_compose(p, IMSG_CTL_OK, 0, 0, -1, NULL, 0);
 		return;

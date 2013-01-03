@@ -2,7 +2,7 @@
 
 /*
  * Copyright (c) 2000,2001 Markus Friedl.  All rights reserved.
- * Copyright (c) 2008 Gilles Chehade <gilles@openbsd.org>
+ * Copyright (c) 2008 Gilles Chehade <gilles@poolp.org>
  * Copyright (c) 2009 Jacek Masiulaniec <jacekm@dobremiasto.net>
  * Copyright (c) 2012 Eric Faurot <eric@openbsd.org>
  *
@@ -121,6 +121,23 @@ iobuf_xfqueue(struct iobuf *io, const char *where, const char *fmt, ...)
 		errx(1, "%s: iobuf_xfqueue(%p, %s, ...)", where, io, fmt);
 }
 #endif
+
+char *
+strip(char *s)
+{
+	size_t	 l;
+
+	while (*s == ' ' || *s == '\t')
+		s++;
+
+	for (l = strlen(s); l; l--) {
+		if (s[l-1] != ' ' && s[l-1] != '\t')
+			break;
+		s[l-1] = '\0';
+	}
+
+	return (s);
+}
 
 int
 bsnprintf(char *str, size_t size, const char *format, ...)
