@@ -1,4 +1,4 @@
-/*	$OpenBSD: smtp.c,v 1.121 2012/11/12 14:58:53 eric Exp $	*/
+/*	$OpenBSD: smtp.c,v 1.123 2013/01/26 09:37:23 gilles Exp $	*/
 
 /*
  * Copyright (c) 2008 Gilles Chehade <gilles@poolp.org>
@@ -36,8 +36,11 @@
 #include <string.h>
 #include <unistd.h>
 
+#include <openssl/ssl.h>
+
 #include "smtpd.h"
 #include "log.h"
+#include "ssl.h"
 
 static void smtp_imsg(struct mproc *, struct imsg *);
 static void smtp_shutdown(void);
@@ -55,21 +58,17 @@ static size_t	sessions;
 static void
 smtp_imsg(struct mproc *p, struct imsg *imsg)
 {
-	struct listener		*l;
-	struct ssl		*ssl;
+	struct listener	*l;
+	struct ssl	*ssl;
+	struct msg	 m;
+	int		 v;
 
 	if (p->proc == PROC_LKA) {
 		switch (imsg->hdr.type) {
 		case IMSG_DNS_PTR:
 		case IMSG_LKA_EXPAND_RCPT:
-			smtp_session_imsg(p, imsg);
-			return;
 		case IMSG_LKA_AUTHENTICATE:
-			smtp_session_imsg(p, imsg);
-			return;
 		case IMSG_LKA_SSL_INIT:
-			smtp_session_imsg(p, imsg);
-			return;
 		case IMSG_LKA_SSL_VERIFY:
 			smtp_session_imsg(p, imsg);
 			return;
@@ -171,7 +170,17 @@ smtp_imsg(struct mproc *p, struct imsg *imsg)
 			return;
 
 		case IMSG_CTL_VERBOSE:
-			log_verbose(*(int *)imsg->data);
+			m_msg(&m, imsg);
+			m_get_int(&m, &v);
+			m_end(&m);
+			log_verbose(v);
+			return;
+
+		case IMSG_CTL_PROFILE:
+			m_msg(&m, imsg);
+			m_get_int(&m, &v);
+			m_end(&m);
+			profiling = v;
 			return;
 		}
 	}
@@ -247,8 +256,7 @@ smtp(void)
 	if (chdir("/") == -1)
 		fatal("smtp: chdir(\"/\")");
 
-	smtpd_process = PROC_SMTP;
-	setproctitle("%s", env->sc_title[smtpd_process]);
+	config_process(PROC_SMTP);
 
 	if (setgroups(1, &pw->pw_gid) ||
 	    setresgid(pw->pw_gid, pw->pw_gid, pw->pw_gid) ||
@@ -285,6 +293,7 @@ static void
 smtp_setup_events(void)
 {
 	struct listener *l;
+	struct ssl	*ssl, key;
 
 	TAILQ_FOREACH(l, env->sc_listeners, entry) {
 		log_debug("debug: smtp: listen on %s port %d flags 0x%01x"
@@ -299,8 +308,16 @@ smtp_setup_events(void)
 		if (!(env->sc_flags & SMTPD_SMTP_PAUSED))
 			event_add(&l->ev, NULL);
 
-		if (l->flags & F_SSL)
-			ssl_setup(l);
+		if (!(l->flags & F_SSL))
+			continue;
+
+		if (strlcpy(key.ssl_name, l->ssl_cert_name, sizeof(key.ssl_name))
+		    >= sizeof(key.ssl_name))
+			fatal("smtp_setup_events: certificate name truncated");
+		if ((ssl = dict_get(env->sc_ssl_dict, l->ssl_cert_name)) == NULL)
+			fatal("smtp_setup_events: certificate tree corrupted");
+		if (! ssl_setup((SSL_CTX **)&l->ssl_ctx, ssl))
+			fatal("smtp_setup_events: ssl_setup failure");
 	}
 
 	purge_config(PURGE_SSL);

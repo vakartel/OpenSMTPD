@@ -1,4 +1,4 @@
-/*	$OpenBSD: scheduler_ramqueue.c,v 1.24 2012/11/12 14:58:53 eric Exp $	*/
+/*	$OpenBSD: scheduler_ramqueue.c,v 1.26 2013/01/26 09:37:23 gilles Exp $	*/
 
 /*
  * Copyright (c) 2012 Gilles Chehade <gilles@poolp.org>
@@ -128,8 +128,6 @@ static struct rq_queue	ramqueue;
 static struct tree	updates;
 
 static time_t		currtime;
-
-extern int verbose;
 
 static void
 scheduler_ramqueue_init(void)

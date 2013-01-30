@@ -1,4 +1,4 @@
-/*	$OpenBSD$	*/
+/*	$OpenBSD: to.c,v 1.1 2013/01/26 09:37:24 gilles Exp $	*/
 
 /*
  * Copyright (c) 2009 Jacek Masiulaniec <jacekm@dobremiasto.net>
@@ -93,14 +93,18 @@ in6addr_to_text(const struct in6_addr *addr)
 }
 
 int
-email_to_mailaddr(struct mailaddr *maddr, char *email)
+text_to_mailaddr(struct mailaddr *maddr, const char *email)
 {
 	char *username;
 	char *hostname;
+	char  buffer[MAX_LINE_SIZE];
+
+	if (strlcpy(buffer, email, sizeof buffer) >= sizeof buffer)
+		return 0;
 
 	bzero(maddr, sizeof *maddr);
 
-	username = email;
+	username = buffer;
 	hostname = strrchr(username, '@');
 
 	if (hostname == NULL) {
@@ -126,6 +130,20 @@ email_to_mailaddr(struct mailaddr *maddr, char *email)
 
 	return 1;
 }
+
+const char *
+mailaddr_to_text(const struct mailaddr *maddr)
+{
+	static char  buffer[MAX_LINE_SIZE];
+
+	strlcpy(buffer, maddr->user, sizeof buffer);
+	strlcat(buffer, "@", sizeof buffer);
+	if (strlcat(buffer, maddr->domain, sizeof buffer) >= sizeof buffer)
+		return NULL;
+
+	return buffer;
+}
+
 
 const char *
 sa_to_text(const struct sockaddr *sa)
@@ -248,23 +266,22 @@ text_to_netaddr(struct netaddr *netaddr, const char *s)
 	struct sockaddr_in6	ssin6;
 	int			bits;
 
+	bzero(&ssin, sizeof(struct sockaddr_in));
+	bzero(&ssin6, sizeof(struct sockaddr_in6));
+
 	if (strncmp("IPv6:", s, 5) == 0)
 		s += 5;
 
 	if (strchr(s, '/') != NULL) {
 		/* dealing with netmask */
-
-		bzero(&ssin, sizeof(struct sockaddr_in));
 		bits = inet_net_pton(AF_INET, s, &ssin.sin_addr,
 		    sizeof(struct in_addr));
-
 		if (bits != -1) {
 			ssin.sin_family = AF_INET;
 			memcpy(&ss, &ssin, sizeof(ssin));
 			ss.ss_len = sizeof(struct sockaddr_in);
 		}
 		else {
-			bzero(&ssin6, sizeof(struct sockaddr_in6));
 			bits = inet_net_pton(AF_INET6, s, &ssin6.sin6_addr,
 			    sizeof(struct in6_addr));
 			if (bits == -1) {
@@ -380,7 +397,7 @@ text_to_relayhost(struct relayhost *relay, const char *s)
 }
 
 const char *
-relayhost_to_text(struct relayhost *relay)
+relayhost_to_text(const struct relayhost *relay)
 {
 	static char	buf[4096];
 	char		port[4096];

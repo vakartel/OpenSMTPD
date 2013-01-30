@@ -1,4 +1,4 @@
-/*	$OpenBSD: util.c,v 1.88 2012/11/12 14:58:53 eric Exp $	*/
+/*	$OpenBSD: util.c,v 1.90 2013/01/26 09:37:24 gilles Exp $	*/
 
 /*
  * Copyright (c) 2000,2001 Markus Friedl.  All rights reserved.
@@ -290,33 +290,35 @@ rmtree(char *path, int keepdir)
 	path_argv[0] = path;
 	path_argv[1] = NULL;
 	ret = 0;
-	depth = 1;
+	depth = 0;
 
-	if ((fts = fts_open(path_argv, FTS_PHYSICAL, NULL)) == NULL) {
+	fts = fts_open(path_argv, FTS_PHYSICAL | FTS_NOCHDIR, NULL);
+	if (fts == NULL) {
 		warn("fts_open: %s", path);
 		return (-1);
 	}
 
 	while ((e = fts_read(fts)) != NULL) {
-		if (e->fts_number) {
+		switch (e->fts_info) {
+		case FTS_D:
+			depth++;
+			break;
+		case FTS_DP:
+		case FTS_DNR:
 			depth--;
-			if (keepdir && e->fts_number == 1)
+			if (keepdir && depth == 0)
 				continue;
 			if (rmdir(e->fts_path) == -1) {
 				warn("rmdir: %s", e->fts_path);
 				ret = -1;
 			}
-			continue;
-		}
+			break;
 
-		if (S_ISDIR(e->fts_statp->st_mode)) {
-			e->fts_number = depth++;
-			continue;
-		}
-
-		if (unlink(e->fts_path) == -1) {
-			warn("unlink: %s", e->fts_path);
-			ret = -1;
+		case FTS_F:
+			if (unlink(e->fts_path) == -1) {
+				warn("unlink: %s", e->fts_path);
+				ret = -1;
+			}
 		}
 	}
 
@@ -363,14 +365,16 @@ mktmpfile(void)
 {
 	char		path[MAXPATHLEN];
 	int		fd;
+	mode_t		omode;
 
 	if (! bsnprintf(path, sizeof(path), "%s/smtpd.XXXXXXXXXX",
 	    PATH_TEMPORARY))
 		err(1, "snprintf");
 
+	omode = umask(7077);
 	if ((fd = mkstemp(path)) == -1)
 		err(1, "cannot create temporary file %s", path);
-
+	umask(omode);
 	unlink(path);
 	return (fd);
 }
@@ -722,50 +726,4 @@ parse_smtp_response(char *line, size_t len, char **msg, int *cont)
 			return "non-printable character in reply";
 
 	return NULL;
-}
-
-void
-log_envelope(const struct envelope *evp, const char *extra, const char *prefix,
-    const char *status)
-{
-	char rcpt[MAX_LINE_SIZE];
-	char tmp[MAX_LINE_SIZE];
-	const char *method;
-
-	tmp[0] = '\0';
-	rcpt[0] = '\0';
-	if (strcmp(evp->rcpt.user, evp->dest.user) ||
-	    strcmp(evp->rcpt.domain, evp->dest.domain))
-		snprintf(rcpt, sizeof rcpt, "rcpt=<%s@%s>, ",
-		    evp->rcpt.user, evp->rcpt.domain);
-
-	if (evp->type == D_MDA) {
-		if (evp->agent.mda.method == A_MAILDIR)
-			method = "maildir";
-		else if (evp->agent.mda.method == A_MBOX)
-			method = "mbox";
-		else if (evp->agent.mda.method == A_FILENAME)
-			method = "file";
-		else if (evp->agent.mda.method == A_MDA)
-			method = "mda";
-		else
-			fatalx("log_envelope: bad method");
-		snprintf(tmp, sizeof tmp, "user=%s, method=%s, ",
-		    evp->agent.mda.userinfo.username, method);
-	}
-
-	if (extra == NULL)
-		extra = "";
-
-	log_info("%s: %s for %016" PRIx64 ": from=<%s@%s>, to=<%s@%s>, "
-	    "%s%sdelay=%s, %sstat=%s",
-	    evp->type == D_MDA ? "delivery" : "relay",
-	    prefix,
-	    evp->id, evp->sender.user, evp->sender.domain,
-	    evp->dest.user, evp->dest.domain,
-	    rcpt,
-	    tmp,
-	    duration_to_text(time(NULL) - evp->creation),
-	    extra,
-	    status);
 }

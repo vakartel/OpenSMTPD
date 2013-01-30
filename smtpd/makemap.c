@@ -1,4 +1,4 @@
-/*	$OpenBSD: makemap.c,v 1.40 2012/10/13 09:44:25 gilles Exp $	*/
+/*	$OpenBSD: makemap.c,v 1.42 2013/01/26 09:37:23 gilles Exp $	*/
 
 /*
  * Copyright (c) 2008 Gilles Chehade <gilles@poolp.org>
@@ -82,12 +82,6 @@ purge_config(uint8_t what)
 }
 
 int
-ssl_load_certfile(const char *name, uint8_t flags)
-{
-	return (0);
-}
-
-int
 main(int argc, char *argv[])
 {
 	struct stat	 sb;
@@ -96,8 +90,8 @@ main(int argc, char *argv[])
 	char		*conf;
 	int		 ch;
 	DBTYPE		 dbtype = DB_HASH;
-	char		*execname;
 	char		*p;
+	mode_t		 omode;
 
 	log_init(1);
 
@@ -107,7 +101,6 @@ main(int argc, char *argv[])
 	opts = "ho:t:d:";
 	if (mode == P_NEWALIASES)
 		opts = "f:h";
-	execname = argv[0];
 
 	while ((ch = getopt(argc, argv, opts)) != -1) {
 		switch (ch) {
@@ -159,7 +152,7 @@ main(int argc, char *argv[])
 				errx(1, "database name too long");
 		}
 
-		execlp(execname, execname, "-d", argv[0], "-o", dbname, "-",
+		execlp("makemap", "makemap", "-d", argv[0], "-o", dbname, "-",
 		    NULL);
 		err(1, "execlp");
 	}
@@ -186,8 +179,10 @@ main(int argc, char *argv[])
 
 	if (! bsnprintf(dbname, sizeof(dbname), "%s.XXXXXXXXXXX", oflag))
 		errx(1, "path too long");
+	omode = umask(7077);
 	if (mkstemp(dbname) == -1)
 		err(1, "mkstemp");
+	umask(omode);
 
 	db = dbopen(dbname, O_EXLOCK|O_RDWR|O_SYNC, 0644, dbtype, NULL);
 	if (db == NULL) {

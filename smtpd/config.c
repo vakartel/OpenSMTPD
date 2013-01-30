@@ -1,4 +1,4 @@
-/*	$OpenBSD: config.c,v 1.17 2012/09/27 17:47:49 chl Exp $	*/
+/*	$OpenBSD: config.c,v 1.19 2013/01/26 09:37:23 gilles Exp $	*/
 
 /*
  * Copyright (c) 2008 Pierre-Yves Ritschard <pyr@openbsd.org>
@@ -29,8 +29,11 @@
 #include <string.h>
 #include <unistd.h>
 
+#include <openssl/ssl.h>
+
 #include "smtpd.h"
 #include "log.h"
+#include "ssl.h"
 
 static int pipes[PROC_COUNT][PROC_COUNT];
 
@@ -68,8 +71,8 @@ purge_config(uint8_t what)
 	}
 	if (what & PURGE_SSL) {
 		while (dict_poproot(env->sc_ssl_dict, NULL, (void **)&s)) {
-			bzero(s->ssl_cert, sizeof s->ssl_cert);
-			bzero(s->ssl_key, sizeof s->ssl_key);
+			bzero(s->ssl_cert, s->ssl_cert_len);
+			bzero(s->ssl_key, s->ssl_key_len);
 			free(s->ssl_cert);
 			free(s->ssl_key);
 			free(s);
@@ -97,6 +100,13 @@ init_pipes(void)
 }
 
 void
+config_process(enum smtp_proc_type proc)
+{
+	smtpd_process = proc;
+	setproctitle("%s", proc_title(proc));
+}
+
+void
 config_peer(enum smtp_proc_type proc)
 {
 	struct mproc	*p;
@@ -106,7 +116,7 @@ config_peer(enum smtp_proc_type proc)
 
 	p = xcalloc(1, sizeof *p, "config_peer");
 	p->proc = proc;
-	p->name = xstrdup(proc_to_str(proc), "config_peer");
+	p->name = xstrdup(proc_name(proc), "config_peer");
 	p->handler = imsg_dispatch;
 
 	mproc_init(p, pipes[smtpd_process][proc]);
@@ -135,10 +145,14 @@ config_peer(enum smtp_proc_type proc)
 		fatalx("bad peer");
 }
 
+static void process_stat_event(int, short, void *);
+
 void
 config_done(void)
 {
-	unsigned int	i, j;
+	static struct event	ev;
+	struct timeval		tv;
+	unsigned int		i, j;
 
 	for (i = 0; i < PROC_COUNT; i++) {
 		for (j = 0; j < PROC_COUNT; j++) {
@@ -148,4 +162,51 @@ config_done(void)
 			pipes[i][j] = -1;
 		}
 	}
+
+	if (smtpd_process == PROC_CONTROL)
+		return;
+
+	evtimer_set(&ev, process_stat_event, &ev);
+	tv.tv_sec = 0;
+	tv.tv_usec = 0;
+	evtimer_add(&ev, &tv);
+}
+
+static void
+process_stat(struct mproc *p)
+{
+	char			buf[1024];
+	struct stat_value	value;
+
+	if (p == NULL)
+		return;
+
+	value.type = STAT_COUNTER;
+	snprintf(buf, sizeof buf, "buffer.%s.%s",
+	    proc_name(smtpd_process),
+	    proc_name(p->proc));
+	value.u.counter = p->bytes_queued_max;
+	p->bytes_queued_max = p->bytes_queued;
+	stat_set(buf, &value);
+}
+
+static void
+process_stat_event(int fd, short ev, void *arg)
+{
+	struct event	*e = arg;
+	struct timeval	 tv;
+
+	process_stat(p_control);
+	process_stat(p_lka);
+	process_stat(p_mda);
+	process_stat(p_mfa);
+	process_stat(p_mda);
+	process_stat(p_parent);
+	process_stat(p_queue);
+	process_stat(p_scheduler);
+	process_stat(p_smtp);
+
+	tv.tv_sec = 1;
+	tv.tv_usec = 0;
+	evtimer_add(e, &tv);
 }

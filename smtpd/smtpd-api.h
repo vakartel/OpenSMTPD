@@ -1,4 +1,4 @@
-/*	$OpenBSD: filter_api.h,v 1.4 2012/08/20 21:14:17 gilles Exp $	*/
+/*	$OpenBSD: smtpd-api.h,v 1.1 2013/01/26 09:37:23 gilles Exp $	*/
 
 /*
  * Copyright (c) 2011 Gilles Chehade <gilles@poolp.org>
@@ -31,6 +31,11 @@
 #define MAX_LINE_SIZE		 2048
 #define MAX_LOCALPART_SIZE	 64
 #define MAX_DOMAINPART_SIZE	 255
+
+struct mailaddr {
+	char	user[MAX_LOCALPART_SIZE];
+	char	domain[MAX_DOMAINPART_SIZE];
+};
 
 SPLAY_HEAD(dict, dictentry);
 SPLAY_HEAD(tree, treeentry);
@@ -70,57 +75,9 @@ enum filter_hook {
 };
 
 struct filter_connect {
-	struct sockaddr_storage	local;
-	struct sockaddr_storage	remote;
-	char			hostname[MAXHOSTNAMELEN];
-};
-
-struct filter_line {
-	char			line[MAX_LINE_SIZE];
-};
-
-struct filter_mailaddr {
-	char			user[MAX_LOCALPART_SIZE];
-	char			domain[MAX_DOMAINPART_SIZE];
-};
-
-struct filter_register_msg {
-	int	hooks;
-	int	flags;
-};
-
-struct filter_query_msg {
-	uint64_t			id;
-	uint64_t			qid;
-	enum filter_hook		hook;
-	union {
-		struct filter_connect	connect;
-		struct filter_line	line;
-		struct filter_mailaddr	maddr;
-	} u;
-};
-
-struct filter_event_msg {
-	uint64_t		id;
-	enum filter_hook	event;
-};
-
-struct filter_notify_msg {
-	uint64_t		qid;
-	enum filter_status	status;
-};
-
-struct filter_data_msg {
-	uint64_t		id;
-	char			line[MAX_LINE_SIZE];
-};
-
-struct filter_response_msg {
-	uint64_t		qid;
-	enum filter_status	status;
-	uint32_t		code;
-	int			notify;
-	char			response[MAX_LINE_SIZE];
+	struct sockaddr_storage	 local;
+	struct sockaddr_storage	 remote;
+	const char		*hostname;
 };
 
 /* dict.c */
@@ -151,8 +108,8 @@ void filter_api_data(uint64_t, const char *);
 void filter_api_on_notify(void(*)(uint64_t, enum filter_status));
 void filter_api_on_connect(void(*)(uint64_t, uint64_t, struct filter_connect *));
 void filter_api_on_helo(void(*)(uint64_t, uint64_t, const char *));
-void filter_api_on_mail(void(*)(uint64_t, uint64_t, struct filter_mailaddr *));
-void filter_api_on_rcpt(void(*)(uint64_t, uint64_t, struct filter_mailaddr *));
+void filter_api_on_mail(void(*)(uint64_t, uint64_t, struct mailaddr *));
+void filter_api_on_rcpt(void(*)(uint64_t, uint64_t, struct mailaddr *));
 void filter_api_on_data(void(*)(uint64_t, uint64_t));
 void filter_api_on_dataline(void(*)(uint64_t, const char *), int);
 void filter_api_on_eom(void(*)(uint64_t, uint64_t));
