@@ -1,7 +1,7 @@
-/*	$OpenBSD: map.c,v 1.35 2012/11/12 14:58:53 eric Exp $	*/
+/*	$OpenBSD: table.c,v 1.3 2013/02/05 15:23:40 gilles Exp $	*/
 
 /*
- * Copyright (c) 2008 Gilles Chehade <gilles@openbsd.org>
+ * Copyright (c) 2008 Gilles Chehade <gilles@poolp.org>
  *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -160,6 +160,17 @@ table_destroy(struct table *t)
 }
 
 void
+table_replace(struct table *orig, struct table *tnew)
+{
+	void	*p = NULL;
+
+	while (dict_poproot(&orig->t_dict, NULL, (void **)&p))
+		free(p);
+	dict_merge(&orig->t_dict, &tnew->t_dict);
+	table_destroy(tnew);
+}
+
+void
 table_set_configuration(struct table *t, struct table *config)
 {
 	strlcpy(t->t_cfgtable, config->t_name, sizeof t->t_cfgtable);
@@ -304,8 +315,12 @@ table_config_parse(void *p, const char *config, enum table_type type)
 		valp = keyp;
 		strsep(&valp, " \t:");
 		if (valp) {
-			while (*valp && isspace(*valp))
+			while (*valp) {
+				if (!isspace(*valp) &&
+				    !(*valp == ':' && isspace(*(valp + 1))))
+					break;
 				++valp;
+			}
 			if (*valp == '\0')
 				valp = NULL;
 		}
@@ -336,6 +351,26 @@ int
 table_domain_match(const char *s1, const char *s2)
 {
 	return hostname_match(s1, s2);
+}
+
+int
+table_mailaddr_match(const char *s1, const char *s2)
+{
+	struct mailaddr m1;
+	struct mailaddr m2;
+
+	if (! text_to_mailaddr(&m1, s1))
+		return 0;
+	if (! text_to_mailaddr(&m2, s2))
+		return 0;
+
+	if (strcasecmp(m1.domain, m2.domain))
+		return 0;
+
+	if (m2.user[0])
+		if (strcasecmp(m1.user, m2.user))
+			return 0;
+	return 1;
 }
 
 static int table_match_mask(struct sockaddr_storage *, struct netaddr *);

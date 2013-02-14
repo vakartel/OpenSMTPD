@@ -1,7 +1,7 @@
-/*	$OpenBSD: mfa.c,v 1.73 2012/11/12 14:58:53 eric Exp $	*/
+/*	$OpenBSD: mfa.c,v 1.75 2013/01/26 09:37:23 gilles Exp $	*/
 
 /*
- * Copyright (c) 2008 Gilles Chehade <gilles@openbsd.org>
+ * Copyright (c) 2008 Gilles Chehade <gilles@poolp.org>
  * Copyright (c) 2008 Pierre-Yves Ritschard <pyr@openbsd.org>
  *
  * Permission to use, copy, modify, and distribute this software for any
@@ -45,50 +45,99 @@ static void mfa_sig_handler(int, short, void *);
 static void
 mfa_imsg(struct mproc *p, struct imsg *imsg)
 {
-	struct mfa_connect_msg		*req_connect;
-	struct mfa_req_msg		*req;
-	struct mfa_smtp_resp_msg	 resp;
-	struct filter			*filter;
+	struct sockaddr_storage	 local, remote;
+	struct mailaddr		 maddr;
+	struct filter		*filter;
+	struct msg		 m;
+	const char		*line, *hostname;
+	uint64_t		 reqid;
+	int			 v;
 
 	if (p->proc == PROC_SMTP) {
 		switch (imsg->hdr.type) {
 		case IMSG_MFA_REQ_CONNECT:
-			req_connect = imsg->data;
-
-			log_debug("mfa: CONNECT %s <-> %s",
-			    ss_to_text(&req_connect->local),
-			    ss_to_text(&req_connect->peer));
-
-			resp.reqid = req_connect->reqid;
-			resp.status = MFA_OK;
-			resp.code = 0;
-			resp.line[0] = '\0';
-			m_compose(p, IMSG_MFA_SMTP_RESPONSE, 0, 0, -1,
-			    &resp, sizeof(resp));
+			m_msg(&m, imsg);
+			m_get_id(&m, &reqid);
+			m_get_sockaddr(&m, (struct sockaddr *)&local);
+			m_get_sockaddr(&m, (struct sockaddr *)&remote);
+			m_get_string(&m, &hostname);
+			m_end(&m);
+			mfa_filter_connect(reqid, (struct sockaddr *)&local,
+			    (struct sockaddr *)&remote, hostname);
 			return;
 
 		case IMSG_MFA_REQ_HELO:
+			m_msg(&m, imsg);
+			m_get_id(&m, &reqid);
+			m_get_string(&m, &line);
+			m_end(&m);
+			mfa_filter_line(reqid, HOOK_HELO, line);
+			return;
+
 		case IMSG_MFA_REQ_MAIL:
+			m_msg(&m, imsg);
+			m_get_id(&m, &reqid);
+			m_get_mailaddr(&m, &maddr);
+			m_end(&m);
+			mfa_filter_mailaddr(reqid, HOOK_MAIL, &maddr);
+			return;
+
 		case IMSG_MFA_REQ_RCPT:
+			m_msg(&m, imsg);
+			m_get_id(&m, &reqid);
+			m_get_mailaddr(&m, &maddr);
+			m_end(&m);
+			mfa_filter_mailaddr(reqid, HOOK_RCPT, &maddr);
+			return;
+
 		case IMSG_MFA_REQ_DATA:
+			m_msg(&m, imsg);
+			m_get_id(&m, &reqid);
+			m_end(&m);
+			mfa_filter(reqid, HOOK_DATA);
+			return;
+
 		case IMSG_MFA_REQ_EOM:
-			req = imsg->data;
-			resp.reqid = req->reqid;
-			resp.status = MFA_OK;
-			resp.code = 0;
-			resp.line[0] = '\0';
-			m_compose(p, IMSG_MFA_SMTP_RESPONSE, 0, 0, -1,
-			    &resp, sizeof(resp));
+			m_msg(&m, imsg);
+			m_get_id(&m, &reqid);
+			m_end(&m);
+			mfa_filter(reqid, HOOK_EOM);
 			return;
 
 		case IMSG_MFA_SMTP_DATA:
-			m_forward(p, imsg);
+			m_msg(&m, imsg);
+			m_get_id(&m, &reqid);
+			m_get_string(&m, &line);
+			m_end(&m);
+			mfa_filter_data(reqid, line);
 			return;
 
 		case IMSG_MFA_EVENT_RSET:
+			m_msg(&m, imsg);
+			m_get_id(&m, &reqid);
+			m_end(&m);
+			mfa_filter_event(reqid, HOOK_RESET);
+			return;
+
 		case IMSG_MFA_EVENT_COMMIT:
+			m_msg(&m, imsg);
+			m_get_id(&m, &reqid);
+			m_end(&m);
+			mfa_filter_event(reqid, HOOK_COMMIT);
+			return;
+
+		case IMSG_MFA_EVENT_ROLLBACK:
+			m_msg(&m, imsg);
+			m_get_id(&m, &reqid);
+			m_end(&m);
+			mfa_filter_event(reqid, HOOK_ROLLBACK);
+			return;
+
 		case IMSG_MFA_EVENT_DISCONNECT:
-			/* No reponse expected */
+			m_msg(&m, imsg);
+			m_get_id(&m, &reqid);
+			m_end(&m);
+			mfa_filter_event(reqid, HOOK_DISCONNECT);
 			return;
 		}
 	}
@@ -106,10 +155,21 @@ mfa_imsg(struct mproc *p, struct imsg *imsg)
 			return;
 
 		case IMSG_CONF_END:
+			mfa_filter_init();
 			return;
 
 		case IMSG_CTL_VERBOSE:
-			log_verbose(*(int *)imsg->data);
+			m_msg(&m, imsg);
+			m_get_int(&m, &v);
+			m_end(&m);
+			log_verbose(v);
+			return;
+
+		case IMSG_CTL_PROFILE:
+			m_msg(&m, imsg);
+			m_get_int(&m, &v);
+			m_end(&m);
+			profiling = v;
 			return;
 		}
 	}
@@ -148,7 +208,6 @@ mfa_shutdown(void)
 	_exit(0);
 }
 
-
 pid_t
 mfa(void)
 {
@@ -162,6 +221,7 @@ mfa(void)
 	case -1:
 		fatal("mfa: cannot fork");
 	case 0:
+		env->sc_pid = getpid();
 		break;
 	default:
 		return (pid);
@@ -174,8 +234,7 @@ mfa(void)
 			fatalx("unknown user " SMTPD_USER);
 	pw = env->sc_pw;
 
-	smtpd_process = PROC_MFA;
-	setproctitle("%s", env->sc_title[smtpd_process]);
+	config_process(PROC_MFA);
 
 	if (setgroups(1, &pw->pw_gid) ||
 	    setresgid(pw->pw_gid, pw->pw_gid, pw->pw_gid) ||
@@ -199,10 +258,18 @@ mfa(void)
 	config_peer(PROC_CONTROL);
 	config_done();
 
-	imsgproc_init();
+	mproc_disable(p_smtp);
+
 	if (event_dispatch() < 0)
 		fatal("event_dispatch");
 	mfa_shutdown();
 
 	return (0);
+}
+
+void
+mfa_ready(void)
+{
+	log_debug("debug: mfa ready");
+	mproc_enable(p_smtp);
 }

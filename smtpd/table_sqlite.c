@@ -1,7 +1,7 @@
-/*	$OpenBSD$	*/
+/*	$OpenBSD: table_sqlite.c,v 1.2 2013/01/31 18:34:43 eric Exp $	*/
 
 /*
- * Copyright (c) 2012 Gilles Chehade <gilles@openbsd.org>
+ * Copyright (c) 2012 Gilles Chehade <gilles@poolp.org>
  *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -112,6 +112,7 @@ table_sqlite_open(struct table *table)
 
 	if (sqlite3_open(dbpath, &tsh->ppDb) != SQLITE_OK) {
 		log_warnx("table_sqlite: open: %s", sqlite3_errmsg(tsh->ppDb));
+		free(tsh);
 		return NULL;
 	}
 

@@ -1,7 +1,7 @@
-/*	$OpenBSD: aliases.c,v 1.58 2012/11/12 14:58:53 eric Exp $	*/
+/*	$OpenBSD: aliases.c,v 1.61 2013/02/14 12:30:49 gilles Exp $	*/
 
 /*
- * Copyright (c) 2008 Gilles Chehade <gilles@openbsd.org>
+ * Copyright (c) 2008 Gilles Chehade <gilles@poolp.org>
  *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -37,17 +37,21 @@
 static int aliases_expand_include(struct expand *, const char *);
 
 int
-aliases_get(struct table *table, struct expand *expand, const char *username)
+aliases_get(struct expand *expand, const char *username)
 {
 	struct expandnode      *xn;
 	char			buf[MAX_LOCALPART_SIZE];
 	size_t			nbaliases;
 	int			ret;
 	struct expand	       *xp = NULL;
+	struct table	       *mapping = NULL;
+	struct table	       *userbase = NULL;
 
+	mapping = expand->rule->r_mapping;
+	userbase = expand->rule->r_userbase;
 	
 	xlowercase(buf, username, sizeof(buf));
-	ret = table_lookup(table, buf, K_ALIAS, (void **)&xp);
+	ret = table_lookup(mapping, buf, K_ALIAS, (void **)&xp);
 	if (ret <= 0)
 		return ret;
 
@@ -58,6 +62,8 @@ aliases_get(struct table *table, struct expand *expand, const char *username)
 			nbaliases += aliases_expand_include(expand,
 			    xn->u.buffer);
 		else {
+			xn->mapping = mapping;
+			xn->userbase = userbase;
 			expand_insert(expand, xn);
 			nbaliases++;
 		}
@@ -114,8 +120,7 @@ aliases_virtual_check(struct table *table, const struct mailaddr *maddr)
 }
 
 int
-aliases_virtual_get(struct table *table, struct expand *expand,
-    const struct mailaddr *maddr)
+aliases_virtual_get(struct expand *expand, const struct mailaddr *maddr)
 {
 	struct expandnode      *xn;
 	struct expand	       *xp;
@@ -123,6 +128,11 @@ aliases_virtual_get(struct table *table, struct expand *expand,
 	char		       *pbuf;
 	int			nbaliases;
 	int			ret;
+	struct table	       *mapping = NULL;
+	struct table	       *userbase = NULL;
+
+	mapping = expand->rule->r_mapping;
+	userbase = expand->rule->r_userbase;
 
 	if (! bsnprintf(buf, sizeof(buf), "%s@%s", maddr->user,
 		maddr->domain))
@@ -130,7 +140,7 @@ aliases_virtual_get(struct table *table, struct expand *expand,
 	xlowercase(buf, buf, sizeof(buf));
 
 	/* First, we lookup for full entry: user@domain */
-	ret = table_lookup(table, buf, K_ALIAS, (void **)&xp);
+	ret = table_lookup(mapping, buf, K_ALIAS, (void **)&xp);
 	if (ret < 0)
 		return (-1);
 	if (ret)
@@ -139,7 +149,7 @@ aliases_virtual_get(struct table *table, struct expand *expand,
 	/* Failed ? We lookup for username only */
 	pbuf = strchr(buf, '@');
 	*pbuf = '\0';
-	ret = table_lookup(table, buf, K_ALIAS, (void **)&xp);
+	ret = table_lookup(mapping, buf, K_ALIAS, (void **)&xp);
 	if (ret < 0)
 		return (-1);
 	if (ret)
@@ -147,14 +157,14 @@ aliases_virtual_get(struct table *table, struct expand *expand,
 
 	*pbuf = '@';
 	/* Failed ? We lookup for catch all for virtual domain */
-	ret = table_lookup(table, pbuf, K_ALIAS, (void **)&xp);
+	ret = table_lookup(mapping, pbuf, K_ALIAS, (void **)&xp);
 	if (ret < 0)
 		return (-1);
 	if (ret)
 		goto expand;
 
 	/* Failed ? We lookup for a *global* catch all */
-	ret = table_lookup(table, "@", K_ALIAS, (void **)&xp);
+	ret = table_lookup(mapping, "@", K_ALIAS, (void **)&xp);
 	if (ret <= 0)
 		return (ret);
 
@@ -166,6 +176,8 @@ expand:
 			nbaliases += aliases_expand_include(expand,
 			    xn->u.buffer);
 		else {
+			xn->mapping = mapping;
+			xn->userbase = userbase;
 			expand_insert(expand, xn);
 			nbaliases++;
 		}
@@ -184,10 +196,8 @@ aliases_expand_include(struct expand *expand, const char *filename)
 {
 	FILE *fp;
 	char *line;
-	size_t len;
-	size_t lineno = 0;
-	char delim[] = { '\\', '#' };
-	struct expandnode xn;
+	size_t len, lineno = 0;
+	char delim[3] = { '\\', '#', '\0' };
 
 	fp = fopen(filename, "r");
 	if (fp == NULL) {
@@ -196,20 +206,7 @@ aliases_expand_include(struct expand *expand, const char *filename)
 	}
 
 	while ((line = fparseln(fp, &len, &lineno, delim, 0)) != NULL) {
-		if (len == 0) {
-			free(line);
-			continue;
-		}
-
-		if (! text_to_expandnode(&xn, line))
-			log_warnx("warn: could not parse include entry \"%s\".",
-			    line);
-
-		if (xn.type == EXPAND_INCLUDE)
-			log_warnx("warn: nested inclusion is not supported.");
-		else
-			expand_insert(expand, &xn);
-
+		expand_line(expand, line, 0);
 		free(line);
 	}
 

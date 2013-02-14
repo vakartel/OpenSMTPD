@@ -1,7 +1,7 @@
-/*	$OpenBSD: map_static.c,v 1.9 2012/11/12 14:58:53 eric Exp $	*/
+/*	$OpenBSD: table_static.c,v 1.3 2013/02/13 14:34:43 gilles Exp $	*/
 
 /*
- * Copyright (c) 2012 Gilles Chehade <gilles@openbsd.org>
+ * Copyright (c) 2012 Gilles Chehade <gilles@poolp.org>
  *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -52,9 +52,11 @@ static int	table_static_domain(const char *, char *, size_t, void **);
 static int	table_static_netaddr(const char *, char *, size_t, void **);
 static int	table_static_source(const char *, char *, size_t, void **);
 static int	table_static_userinfo(const char *, char *, size_t, void **);
+static int	table_static_mailaddr(const char *, char *, size_t, void **);
+static int	table_static_addrname(const char *, char *, size_t, void **);
 
 struct table_backend table_backend_static = {
-	K_ALIAS|K_CREDENTIALS|K_DOMAIN|K_NETADDR|K_USERINFO|K_SOURCE,
+	K_ALIAS|K_CREDENTIALS|K_DOMAIN|K_NETADDR|K_USERINFO|K_SOURCE|K_MAILADDR|K_ADDRNAME,
 	table_static_config,
 	table_static_open,
 	table_static_update,
@@ -68,7 +70,8 @@ static struct keycmp {
 	int		       (*func)(const char *, const char *);
 } keycmp[] = {
 	{ K_DOMAIN, table_domain_match },
-	{ K_NETADDR, table_netaddr_match }
+	{ K_NETADDR, table_netaddr_match },
+	{ K_MAILADDR, table_mailaddr_match }
 };
 
 
@@ -86,7 +89,6 @@ static int
 table_static_update(struct table *table)
 {
 	struct table   *t;
-	char		name[MAX_LINE_SIZE];
 
 	/* no config ? ok */
 	if (table->t_config[0] == '\0')
@@ -96,26 +98,16 @@ table_static_update(struct table *table)
 	if (! t->t_backend->config(t, table->t_config))
 		goto err;
 
-	/* update successful, swap table names */
-	strlcpy(name, table->t_name, sizeof name);
-	strlcpy(table->t_name, t->t_name, sizeof table->t_name);
-	strlcpy(t->t_name, name, sizeof t->t_name);
-
-	/* swap, table id */
-	table->t_id = table->t_id ^ t->t_id;
-	t->t_id     = table->t_id ^ t->t_id;
-	table->t_id = table->t_id ^ t->t_id;
-
-	/* destroy former table */
-	table_destroy(table);
+	/* replace former table, frees t */
+	table_replace(table, t);
 
 ok:
-	log_info("info: Table \"%s\" successfully updated", name);
+	log_info("info: Table \"%s\" successfully updated", table->t_name);
 	return 1;
 
 err:
 	table_destroy(t);
-	log_info("info: Failed to update table \"%s\"", name);
+	log_info("info: Failed to update table \"%s\"", table->t_name);
 	return 0;
 }
 
@@ -168,6 +160,7 @@ table_static_lookup(void *hdl, const char *key, enum table_service service,
 		if (ret)
 			break;
 	}
+
 	if (retp == NULL)
 		return ret ? 1 : 0;
 
@@ -178,7 +171,6 @@ table_static_lookup(void *hdl, const char *key, enum table_service service,
 
 	if ((line = strdup(line)) == NULL)
 		return -1;
-
 	len = strlen(line);
 	switch (service) {
 	case K_ALIAS:
@@ -199,10 +191,18 @@ table_static_lookup(void *hdl, const char *key, enum table_service service,
 
 	case K_SOURCE:
 		ret = table_static_source(key, line, len, retp);
+		break;
 
 	case K_USERINFO:
 		ret = table_static_userinfo(key, line, len, retp);
+		break;
 
+	case K_MAILADDR:
+		ret = table_static_mailaddr(key, line, len, retp);
+		break;
+
+	case K_ADDRNAME:
+		ret = table_static_addrname(key, line, len, retp);
 		break;
 
 	default:
@@ -284,7 +284,7 @@ table_static_alias(const char *key, char *line, size_t len, void **retp)
 	struct expand		*xp;
 
 	xp = xcalloc(1, sizeof *xp, "table_static_alias");
-	if (! expand_line(xp, line))
+	if (! expand_line(xp, line, 1))
 		goto error;
 	*retp = xp;
 	return 1;
@@ -351,10 +351,14 @@ error:
 static int
 table_static_userinfo(const char *key, char *line, size_t len, void **retp)
 {
-	struct userinfo		*userinfo;
+	struct userinfo		*userinfo = NULL;
+	char			buffer[1024];
+
+	if (! bsnprintf(buffer, sizeof buffer, "%s:%s", key, line))
+		goto error;
 
 	userinfo = xcalloc(1, sizeof *userinfo, "table_static_userinfo");
-	if (! text_to_userinfo(userinfo, line))
+	if (! text_to_userinfo(userinfo, buffer))
 	    goto error;
 	*retp = userinfo;
 	return 1;
@@ -362,5 +366,46 @@ table_static_userinfo(const char *key, char *line, size_t len, void **retp)
 error:
 	*retp = NULL;
 	free(userinfo);
+	return -1;
+}
+
+static int
+table_static_mailaddr(const char *key, char *line, size_t len, void **retp)
+{
+	struct mailaddr		*mailaddr;
+
+	mailaddr = xcalloc(1, sizeof *mailaddr, "table_static_mailaddr");
+	if (! text_to_mailaddr(mailaddr, line))
+	    goto error;
+	*retp = mailaddr;
+	return 1;
+
+error:
+	*retp = NULL;
+	free(mailaddr);
+	return -1;
+}
+
+static int
+table_static_addrname(const char *key, char *line, size_t len, void **retp)
+{
+	struct addrname		*addrname;
+
+	addrname = xcalloc(1, sizeof *addrname, "table_static_addrname");
+
+	if (inet_pton(AF_INET6, key, &addrname->addr.in6) != 1)
+		if (inet_pton(AF_INET, key, &addrname->addr.in4) != 1)
+			goto error;
+
+	if (strlcpy(addrname->name, line, sizeof addrname->name)
+	    >= sizeof addrname->name)
+		goto error;
+
+	*retp = addrname;
+	return 1;
+
+error:
+	*retp = NULL;
+	free(addrname);
 	return -1;
 }

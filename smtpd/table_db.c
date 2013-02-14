@@ -1,7 +1,7 @@
-/*	$OpenBSD: map_db.c,v 1.12 2012/11/12 14:58:53 eric Exp $	*/
+/*	$OpenBSD: table_db.c,v 1.3 2013/02/13 14:34:43 gilles Exp $	*/
 
 /*
- * Copyright (c) 2011 Gilles Chehade <gilles@openbsd.org>
+ * Copyright (c) 2011 Gilles Chehade <gilles@poolp.org>
  *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -83,13 +83,13 @@ struct dbhandle {
 static int
 table_db_config(struct table *table, const char *config)
 {
-	DB	*db;
+	struct dbhandle	       *handle;
 
-	db = table_db_open(table);
-	if (db == NULL)
+	handle = table_db_open(table);
+	if (handle == NULL)
 		return 0;
 
-	table_db_close(db);
+	table_db_close(handle);
 	return 1;
 }
 
@@ -103,7 +103,6 @@ table_db_update(struct table *table)
 		return 0;
 
 	table_db_close(table->t_handle);
-	free(table->t_handle);
 	table->t_handle = handle;
 	return 1;
 }
@@ -142,6 +141,7 @@ table_db_close(void *hdl)
 {
 	struct dbhandle	*handle = hdl;
 	handle->db->close(handle->db);
+	free(handle);
 }
 
 static int
@@ -174,8 +174,10 @@ table_db_lookup(void *hdl, const char *key, enum table_service service,
 	if (line == NULL)
 		return 0;
 
-	if (retp == NULL)
+	if (retp == NULL) {
+		free(line);
 		return 1;
+	}
 
 	ret = 0;
 	switch (service) {
@@ -324,7 +326,7 @@ table_db_alias(const char *key, char *line, size_t len, void **retp)
 	struct expand	*xp = NULL;
 
 	xp = xcalloc(1, sizeof *xp, "table_db_alias");
-	if (! expand_line(xp, line))
+	if (! expand_line(xp, line, 1))
 		goto error;
 	*retp = xp;
 	return 1;
@@ -373,10 +375,14 @@ error:
 static int
 table_db_userinfo(const char *key, char *line, size_t len, void **retp)
 {
-	struct userinfo		*userinfo;
+	struct userinfo		*userinfo = NULL;
+	char			buffer[1024];
+
+	if (! bsnprintf(buffer, sizeof buffer, "%s:%s", key, line))
+		goto error;
 
 	userinfo = xcalloc(1, sizeof *userinfo, "table_db_userinfo");
-	if (! text_to_userinfo(userinfo, line))
+	if (! text_to_userinfo(userinfo, buffer))
 	    goto error;
 	*retp = userinfo;
 	return 1;

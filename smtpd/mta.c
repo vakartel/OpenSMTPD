@@ -1,8 +1,8 @@
-/*	$OpenBSD: mta.c,v 1.148 2012/11/12 14:58:53 eric Exp $	*/
+/*	$OpenBSD: mta.c,v 1.154 2013/02/08 13:29:09 eric Exp $	*/
 
 /*
  * Copyright (c) 2008 Pierre-Yves Ritschard <pyr@openbsd.org>
- * Copyright (c) 2008 Gilles Chehade <gilles@openbsd.org>
+ * Copyright (c) 2008 Gilles Chehade <gilles@poolp.org>
  * Copyright (c) 2009 Jacek Masiulaniec <jacekm@dobremiasto.net>
  * Copyright (c) 2012 Eric Faurot <eric@openbsd.org>
  *
@@ -47,22 +47,32 @@
 
 #define MAXCONN_PER_HOST	10
 #define MAXCONN_PER_ROUTE	5
-#define MAXCONN_PER_SOURCE	50
+#define MAXCONN_PER_SOURCE	50	/* XXX missing */
+#define MAXCONN_PER_CONNECTOR	20
 #define MAXCONN_PER_RELAY	100
+
+#define CONNECTOR_DELAY_CONNECT	1
+#define CONNECTOR_DELAY_LIMIT	5
 
 static void mta_imsg(struct mproc *, struct imsg *);
 static void mta_shutdown(void);
 static void mta_sig_handler(int, short, void *);
 
-static void mta_query_mx(struct mta_domain *);
+static void mta_query_mx(struct mta_relay *);
 static void mta_query_secret(struct mta_relay *);
 static void mta_query_preference(struct mta_relay *);
 static void mta_query_source(struct mta_relay *);
 static void mta_on_mx(void *, void *, void *);
 static void mta_on_source(struct mta_relay *, struct mta_source *);
+static void mta_connect(struct mta_connector *);
+static void mta_recycle(struct mta_connector *);
 static void mta_drain(struct mta_relay *);
+static void mta_relay_schedule(struct mta_relay *, unsigned int);
+static void mta_relay_timeout(int, short, void *);
 static void mta_flush(struct mta_relay *, int, const char *);
-static struct mta_route *mta_find_route(struct mta_relay*, struct mta_source*);
+static struct mta_route *mta_find_route(struct mta_connector *);
+static void mta_log(const struct mta_envelope *, const char *, const char *,
+    const char *);
 
 SPLAY_HEAD(mta_relay_tree, mta_relay);
 static struct mta_relay *mta_relay(struct envelope *);
@@ -80,7 +90,9 @@ SPLAY_PROTOTYPE(mta_host_tree, mta_host, entry, mta_host_cmp);
 
 SPLAY_HEAD(mta_domain_tree, mta_domain);
 static struct mta_domain *mta_domain(char *, int);
+#if 0
 static void mta_domain_ref(struct mta_domain *);
+#endif
 static void mta_domain_unref(struct mta_domain *);
 static int mta_domain_cmp(const struct mta_domain *, const struct mta_domain *);
 SPLAY_PROTOTYPE(mta_domain_tree, mta_domain, entry, mta_domain_cmp);
@@ -93,32 +105,26 @@ static const char *mta_source_to_text(struct mta_source *);
 static int mta_source_cmp(const struct mta_source *, const struct mta_source *);
 SPLAY_PROTOTYPE(mta_source_tree, mta_source, entry, mta_source_cmp);
 
+static struct mta_connector *mta_connector(struct mta_relay *,
+    struct mta_source *);
+static void mta_connector_free(struct mta_connector *);
+static const char *mta_connector_to_text(struct mta_connector *);
+
 SPLAY_HEAD(mta_route_tree, mta_route);
 static struct mta_route *mta_route(struct mta_source *, struct mta_host *);
+#if 0
 static void mta_route_ref(struct mta_route *);
+#endif
 static void mta_route_unref(struct mta_route *);
 static const char *mta_route_to_text(struct mta_route *);
 static int mta_route_cmp(const struct mta_route *, const struct mta_route *);
 SPLAY_PROTOTYPE(mta_route_tree, mta_route, entry, mta_route_cmp);
 
-static inline uint64_t
-ptoid(void * p)
-{
-	union {
-		void	*p;
-		uint64_t v;
-	} u;
-
-	u.v = 0;
-	u.p = p;
-	return (u.v);
-}
-
-static struct mta_relay_tree	relays;
-static struct mta_domain_tree	domains;
-static struct mta_host_tree	hosts;
-static struct mta_source_tree	sources;
-static struct mta_route_tree	routes;
+static struct mta_relay_tree		relays;
+static struct mta_domain_tree		domains;
+static struct mta_host_tree		hosts;
+static struct mta_source_tree		sources;
+static struct mta_route_tree		routes;
 
 static struct tree batches;
 
@@ -130,46 +136,58 @@ static struct tree wait_source;
 void
 mta_imsg(struct mproc *p, struct imsg *imsg)
 {
-	struct lka_source_resp_msg	*resp_addr;
-	struct dns_resp_msg	*resp_dns;
 	struct mta_relay	*relay;
 	struct mta_task		*task;
 	struct mta_source	*source;
 	struct mta_domain	*domain;
 	struct mta_mx		*mx, *imx;
-	struct sockaddr		*sa;
+	struct mta_envelope	*e;
+	struct sockaddr_storage	 ss;
 	struct tree		*batch;
-	struct secret		*secret;
-	struct envelope		*e;
-	struct ssl		*ssl;
-	uint64_t		 id;
+	struct envelope		 evp;
+	struct msg		 m;
+	const char		*secret;
+	uint64_t		 reqid;
+	char			 buf[MAX_LINE_SIZE];
+	int			 dnserror, preference, v, status;
 
 	if (p->proc == PROC_QUEUE) {
 		switch (imsg->hdr.type) {
 
 		case IMSG_MTA_BATCH:
-			id = *(uint64_t*)(imsg->data);
+			m_msg(&m, imsg);
+			m_get_id(&m, &reqid);
+			m_end(&m);
 			batch = xmalloc(sizeof *batch, "mta_batch");
 			tree_init(batch);
-			tree_xset(&batches, id, batch);
+			tree_xset(&batches, reqid, batch);
 			log_trace(TRACE_MTA,
-			    "mta: batch:%016" PRIx64 " created", id);
+			    "mta: batch:%016" PRIx64 " created", reqid);
 			return;
 
 		case IMSG_MTA_BATCH_ADD:
-			e = xmemdup(imsg->data, sizeof *e, "mta:envelope");
-			relay = mta_relay(e);
-			batch = tree_xget(&batches, e->batch_id);
+			m_msg(&m, imsg);
+			m_get_id(&m, &reqid);
+			m_get_envelope(&m, &evp);
+			m_end(&m);
+
+			relay = mta_relay(&evp);
+			batch = tree_xget(&batches, reqid);
 
 			if ((task = tree_get(batch, relay->id)) == NULL) {
-				log_trace(TRACE_MTA, "mta: new task for relay "
-				    "%s", mta_relay_to_text(relay));
+				log_trace(TRACE_MTA, "mta: new task for %s",
+				    mta_relay_to_text(relay));
 				task = xmalloc(sizeof *task, "mta_task");
 				TAILQ_INIT(&task->envelopes);
 				task->relay = relay;
 				tree_xset(batch, relay->id, task);
-				task->msgid = evpid_to_msgid(e->id);
-				task->sender = e->sender;
+				task->msgid = evpid_to_msgid(evp.id);
+				if (evp.sender.user[0] || evp.sender.domain[0])
+					snprintf(buf, sizeof buf, "%s@%s",
+					    evp.sender.user, evp.sender.domain);
+				else
+					buf[0] = '\0';
+				task->sender = xstrdup(buf, "mta_task:sender");
 			} else
 				mta_relay_unref(relay); /* from here */
 
@@ -178,25 +196,37 @@ mta_imsg(struct mproc *p, struct imsg *imsg)
 			 * level, but the batch sent by the scheduler should
 			 * be valid.
 			 */
-			if (task->msgid != evpid_to_msgid(e->id))
+			if (task->msgid != evpid_to_msgid(evp.id))
 				errx(1, "msgid mismatch in batch");
 
+			e = xcalloc(1, sizeof *e, "mta_envelope");
+			e->id = evp.id;
+			e->creation = evp.creation;
+			snprintf(buf, sizeof buf, "%s@%s",
+			    evp.dest.user, evp.dest.domain);
+			e->dest = xstrdup(buf, "mta_envelope:dest");
+			snprintf(buf, sizeof buf, "%s@%s",
+			    evp.rcpt.user, evp.rcpt.domain);
+			if (strcmp(buf, e->dest))
+				e->rcpt = xstrdup(buf, "mta_envelope:rcpt");
+			e->task = task;
 			/* XXX honour relay->maxrcpt */
 			TAILQ_INSERT_TAIL(&task->envelopes, e, entry);
 			stat_increment("mta.envelope", 1);
 			log_debug("debug: mta: received evp:%016" PRIx64
-			    " for <%s@%s>",
-			    e->id, e->dest.user, e->dest.domain);
+			    " for <%s>", e->id, e->dest);
 			return;
 
 		case IMSG_MTA_BATCH_END:
-			id = *(uint64_t*)(imsg->data);
-			batch = tree_xpop(&batches, id);
+			m_msg(&m, imsg);
+			m_get_id(&m, &reqid);
+			m_end(&m);
+			batch = tree_xpop(&batches, reqid);
 			log_trace(TRACE_MTA, "mta: batch:%016" PRIx64 " closed",
-			    id);
+			    reqid);
 			/* For all tasks, queue them on its relay */
-			while (tree_poproot(batch, &id, (void**)&task)) {
-				if (id != task->relay->id)
+			while (tree_poproot(batch, &reqid, (void**)&task)) {
+				if (reqid != task->relay->id)
 					errx(1, "relay id mismatch!");
 				relay = task->relay;
 				relay->ntask += 1;
@@ -218,15 +248,18 @@ mta_imsg(struct mproc *p, struct imsg *imsg)
 		switch (imsg->hdr.type) {
 
 		case IMSG_LKA_SECRET:
-			secret = imsg->data;
-			relay = tree_xpop(&wait_secret, secret->id);
-			if (secret->secret[0])
-				relay->secret = strdup(secret->secret);
+			m_msg(&m, imsg);
+			m_get_id(&m, &reqid);
+			m_get_string(&m, &secret);
+			m_end(&m);
+			relay = tree_xpop(&wait_secret, reqid);
+			if (secret[0])
+				relay->secret = strdup(secret);
 			if (relay->secret == NULL) {
-				log_warnx("warn: Failed to retreive secret "
-				    "for relay %s", mta_relay_to_text(relay));
+				log_warnx("warn: Failed to retrieve secret "
+				    "for %s", mta_relay_to_text(relay));
 				relay->fail = IMSG_DELIVERY_TEMPFAIL;
-				relay->failstr = "Could not retreive secret";
+				relay->failstr = "Could not retrieve secret";
 			}
 			relay->status &= ~RELAY_WAIT_SECRET;
 			mta_drain(relay);
@@ -234,33 +267,44 @@ mta_imsg(struct mproc *p, struct imsg *imsg)
 			return;
 
 		case IMSG_LKA_SOURCE:
-			resp_addr = imsg->data;
-			relay = tree_xpop(&wait_source, resp_addr->reqid);
+			m_msg(&m, imsg);
+			m_get_id(&m, &reqid);
+			m_get_int(&m, &status);
+
+			relay = tree_xpop(&wait_source, reqid);
 			relay->status &= ~RELAY_WAIT_SOURCE;
-			if (resp_addr->status == LKA_OK) {
-				sa = (struct sockaddr *)&resp_addr->ss;
-				source = mta_source(sa);
+			if (status == LKA_OK) {
+				m_get_sockaddr(&m, (struct sockaddr*)&ss);
+				source = mta_source((struct sockaddr *)&ss);
 				mta_on_source(relay, source);
+				mta_source_unref(source);
 			}
 			else {
 				log_warnx("warn: Failed to get source address"
-				    "for relay %s", mta_relay_to_text(relay));
-				relay->fail = IMSG_DELIVERY_TEMPFAIL;
-				relay->failstr = "Could not get source address";
+				    "for %s", mta_relay_to_text(relay));
 			}
+			m_end(&m);
+
 			mta_drain(relay);
 			mta_relay_unref(relay); /* from mta_query_source() */
 			return;
 
+		case IMSG_LKA_HELO:
+			mta_session_imsg(p, imsg);
+			return;
+
 		case IMSG_DNS_HOST:
-			resp_dns = imsg->data;
-			domain = tree_xget(&wait_mx, resp_dns->reqid);
-			sa = (struct sockaddr*)&resp_dns->u.host.ss;
+			m_msg(&m, imsg);
+			m_get_id(&m, &reqid);
+			m_get_sockaddr(&m, (struct sockaddr*)&ss);
+			m_get_int(&m, &preference);
+			m_end(&m);
+			domain = tree_xget(&wait_mx, reqid);
 			mx = xcalloc(1, sizeof *mx, "mta: mx");
-			mx->host = mta_host(sa);
-			mx->preference = resp_dns->u.host.preference;
+			mx->host = mta_host((struct sockaddr*)&ss);
+			mx->preference = preference;
 			TAILQ_FOREACH(imx, &domain->mxs, entry) {
-				if (imx->preference >= mx->preference) {
+				if (imx->preference > mx->preference) {
 					TAILQ_INSERT_BEFORE(imx, mx, entry);
 					return;
 				}
@@ -269,9 +313,12 @@ mta_imsg(struct mproc *p, struct imsg *imsg)
 			return;
 
 		case IMSG_DNS_HOST_END:
-			resp_dns = imsg->data;
-			domain = tree_xpop(&wait_mx, resp_dns->reqid);
-			domain->mxstatus = resp_dns->error;
+			m_msg(&m, imsg);
+			m_get_id(&m, &reqid);
+			m_get_int(&m, &dnserror);
+			m_end(&m);
+			domain = tree_xpop(&wait_mx, reqid);
+			domain->mxstatus = dnserror;
 			if (domain->mxstatus == DNS_OK) {
 				log_debug("debug: MXs for domain %s:",
 				    domain->name);
@@ -288,21 +335,23 @@ mta_imsg(struct mproc *p, struct imsg *imsg)
 			return;
 
 		case IMSG_DNS_MX_PREFERENCE:
-			resp_dns = imsg->data;
-			relay = tree_xpop(&wait_preference, resp_dns->reqid);
-			if (resp_dns->error) {
+			m_msg(&m, imsg);
+			m_get_id(&m, &reqid);
+			m_get_int(&m, &dnserror);
+			relay = tree_xpop(&wait_preference, reqid);
+			if (dnserror) {
 				log_debug("debug: couldn't find backup "
-				    "preference for relay %s",
+				    "preference for %s",
 				    mta_relay_to_text(relay));
-				/* use all */
 				relay->backuppref = INT_MAX;
 			} else {
-				relay->backuppref = resp_dns->u.preference;
+				m_get_int(&m, &relay->backuppref);
 				log_debug("debug: found backup preference %i "
-				    "for relay %s",
+				    "for %s",
 				    relay->backuppref,
 				    mta_relay_to_text(relay));
 			}
+			m_end(&m);
 			relay->status &= ~RELAY_WAIT_PREFERENCE;
 			mta_drain(relay);
 			mta_relay_unref(relay); /* from mta_query_preference() */
@@ -311,38 +360,31 @@ mta_imsg(struct mproc *p, struct imsg *imsg)
 		case IMSG_DNS_PTR:
 			mta_session_imsg(p, imsg);
 			return;
+
+		case IMSG_LKA_SSL_INIT:
+			mta_session_imsg(p, imsg);
+			return;
+
+		case IMSG_LKA_SSL_VERIFY:
+			mta_session_imsg(p, imsg);
+			return;
 		}
 	}
 
 	if (p->proc == PROC_PARENT) {
 		switch (imsg->hdr.type) {
-		case IMSG_CONF_START:
-			if (env->sc_flags & SMTPD_CONFIGURING)
-				return;
-			env->sc_flags |= SMTPD_CONFIGURING;
-			env->sc_ssl = xcalloc(1, sizeof *env->sc_ssl,
-			    "mta:sc_ssl");
-			return;
-
-		case IMSG_CONF_SSL:
-			if (!(env->sc_flags & SMTPD_CONFIGURING))
-				return;
-			ssl = xmemdup(imsg->data, sizeof *ssl, "mta:ssl");
-			ssl->ssl_cert = xstrdup((char*)imsg->data + sizeof *ssl,
-			    "mta:ssl_cert");
-			ssl->ssl_key = xstrdup((char*)imsg->data +
-			    sizeof *ssl + ssl->ssl_cert_len, "mta:ssl_key");
-			SPLAY_INSERT(ssltree, env->sc_ssl, ssl);
-			return;
-
-		case IMSG_CONF_END:
-			if (!(env->sc_flags & SMTPD_CONFIGURING))
-				return;
-			env->sc_flags &= ~SMTPD_CONFIGURING;
-			return;
-
 		case IMSG_CTL_VERBOSE:
-			log_verbose(*(int *)imsg->data);
+			m_msg(&m, imsg);
+			m_get_int(&m, &v);
+			m_end(&m);
+			log_verbose(v);
+			return;
+
+		case IMSG_CTL_PROFILE:
+			m_msg(&m, imsg);
+			m_get_int(&m, &v);
+			m_end(&m);
+			profiling = v;
 			return;
 		}
 	}
@@ -382,6 +424,7 @@ mta(void)
 	case -1:
 		fatal("mta: cannot fork");
 	case 0:
+		env->sc_pid = getpid();
 		break;
 	default:
 		return (pid);
@@ -395,8 +438,7 @@ mta(void)
 	if (chdir("/") == -1)
 		fatal("mta: chdir(\"/\")");
 
-	smtpd_process = PROC_MTA;
-	setproctitle("%s", env->sc_title[smtpd_process]);
+	config_process(PROC_MTA);
 
 	if (setgroups(1, &pw->pw_gid) ||
 	    setresgid(pw->pw_gid, pw->pw_gid, pw->pw_gid) ||
@@ -444,60 +486,59 @@ mta(void)
 void
 mta_source_error(struct mta_relay *relay, struct mta_route *route, const char *e)
 {
-	log_info("smtp-out: Error on source %s: %s",
-	    mta_source_to_text(route->src), e);
-
+	struct mta_connector	*c;
 	/*
-	 * Remember the source as broken for this relay.  Take a reference if
-	 * it's not already marked by another session.
+	 * Remember the source as broken for this connector.
 	 */
-	if (tree_set(&relay->source_fail, ptoid(route->src), route->src) == NULL)
-		mta_source_ref(route->src);
+	c = mta_connector(relay, route->src);
+	if (!(c->flags & CONNECTOR_SOURCE_ERROR))
+		log_info("smtp-out: Error on connector %s: %s",
+		    mta_connector_to_text(c), e);
+	c->flags |= CONNECTOR_SOURCE_ERROR;
 }
 
 /*
  * TODO:
  * Currently all errors are reported on the host itself.  Technically,
  * it should depend on the error, and it would be probably better to report
- * it at the route level.  But we would need to have persistent routes
+ * it at the connector level.  But we would need to have persistent routes
  * for that.  Hosts are "naturally" persisted, as they are referenced from
  * the MX list on the domain.
+ * Also, we need a timeout on that.
  */
 void
-mta_route_error(struct mta_relay *relay, struct mta_route *route, const char *e)
+mta_route_error(struct mta_relay *relay, struct mta_route *route)
 {
-	log_info("smtp-out: Error on MX %s: %s",
-	    mta_host_to_text(route->dst), e);
+	route->dst->nerror++;
 
-	if (++route->dst->nerror >= MAXERROR_PER_HOST) {
-		route->dst->flags |= HOST_IGNORE;
-		log_info("smtp-out: Too many errors on MX %s: ignoring this MX",
+	if (route->dst->flags & HOST_IGNORE)
+		return;
+
+	if (route->dst->nerror > MAXERROR_PER_HOST) {
+		log_info("smtp-out: Too many errors on host %s: ignoring this MX",
 		    mta_host_to_text(route->dst));
+		route->dst->flags |= HOST_IGNORE;
 	}
 }
 
 void
 mta_route_ok(struct mta_relay *relay, struct mta_route *route)
 {
-	struct mta_source	*source;
+	struct mta_connector	*c;
 
 	log_debug("debug: mta: route ok %s", mta_route_to_text(route));
 
-	/*
-	 * If a connection was successfully establish, reset all sources.
-	 * This is suboptimal, but it avoids source loops. It must really
-	 * be improved, but we need to have more specific error reports
-	 * for that.
-	 */
-	while (tree_poproot(&relay->source_fail, NULL, (void**)&source))
-		mta_source_unref(source); /* from mta_on_source() */
-
 	route->dst->nerror = 0;
+
+	c = mta_connector(relay, route->src);
+	c->flags &= ~CONNECTOR_SOURCE_ERROR;
 }
 
 void
 mta_route_collect(struct mta_relay *relay, struct mta_route *route)
 {
+	struct mta_connector	*c;
+
 	log_debug("debug: mta: route collect %s", mta_route_to_text(route));
 
 	relay->nconn -= 1;
@@ -505,16 +546,20 @@ mta_route_collect(struct mta_relay *relay, struct mta_route *route)
 	route->src->nconn -= 1;
 	route->dst->nconn -= 1;
 
+	c = mta_connector(relay, route->src);
 	mta_route_unref(route); /* from mta_find_route() */
 
-	/* Reset the limit */
-	if (relay->limit_hit) {
-		relay->limit_hit = 0;
-		log_info("smtp-out: Resetting limit flag on relay %s",
-		    mta_relay_to_text(relay));
+	c->nconn -= 1;
+
+	if (c->flags & CONNECTOR_LIMIT) {
+		log_debug("debug: mta; resetting limit flags on connector %s",
+		    mta_connector_to_text(c));
+		c->flags &= ~CONNECTOR_LIMIT;
 	}
+
+	mta_recycle(c);
 	mta_drain(relay);
-	mta_relay_unref(relay); /* from mta_on_source */
+	mta_relay_unref(relay); /* from mta_connect() */
 }
 
 struct mta_task *
@@ -531,43 +576,78 @@ mta_route_next_task(struct mta_relay *relay, struct mta_route *route)
 	return (task);
 }
 
+void
+mta_delivery(struct mta_envelope *e, const char *relay, int delivery,
+    const char *status)
+{
+	if (delivery == IMSG_DELIVERY_OK) {
+		mta_log(e, "Ok", relay, status);
+		queue_ok(e->id);
+	}
+	else if (delivery == IMSG_DELIVERY_TEMPFAIL) {
+		mta_log(e, "TempFail", relay, status);
+		queue_tempfail(e->id, status);
+	}
+	else if (delivery == IMSG_DELIVERY_PERMFAIL) {
+		mta_log(e, "PermFail", relay, status);
+		queue_permfail(e->id, status);
+	}
+	else if (delivery == IMSG_DELIVERY_LOOP) {
+		mta_log(e, "PermFail", relay, "Loop detected");
+		queue_loop(e->id);
+	}
+	else
+		errx(1, "bad delivery");
+}
+
 static void
-mta_query_mx(struct mta_domain *domain)
+mta_query_mx(struct mta_relay *relay)
 {
 	uint64_t	id;
 
-	log_debug("debug: mta_query_mx(%s)", domain->name);
+	if (relay->status & RELAY_WAIT_MX)
+		return;
 
-	id = generate_uid();
-	tree_xset(&wait_mx, id, domain);
-	if (domain->flags)
-		dns_query_host(id, domain->name);
-	else
-		dns_query_mx(id, domain->name);
-	domain->lastmxquery = time(NULL);
+	log_debug("debug: mta_query_mx(%s)", relay->domain->name);
+
+	if (waitq_wait(&relay->domain->mxs, mta_on_mx, relay)) {
+		id = generate_uid();
+		tree_xset(&wait_mx, id, relay->domain);
+		if (relay->domain->flags)
+			dns_query_host(id, relay->domain->name);
+		else
+			dns_query_mx(id, relay->domain->name);
+		relay->domain->lastmxquery = time(NULL);
+	}
+	relay->status |= RELAY_WAIT_MX;
+	mta_relay_ref(relay);
 }
 
 static void
 mta_query_secret(struct mta_relay *relay)
 {
-	struct secret	secret;
+	if (relay->status & RELAY_WAIT_SECRET)
+		return;
 
 	log_debug("debug: mta_query_secret(%s)", mta_relay_to_text(relay));
 
 	tree_xset(&wait_secret, relay->id, relay);
 	relay->status |= RELAY_WAIT_SECRET;
 
-	bzero(&secret, sizeof(secret));
-	secret.id = relay->id;
-	strlcpy(secret.tablename, relay->authtable, sizeof(secret.tablename));
-	strlcpy(secret.label, relay->authlabel, sizeof(secret.label));
-	m_compose(p_lka, IMSG_LKA_SECRET, 0, 0, -1, &secret, sizeof(secret));
+	m_create(p_lka, IMSG_LKA_SECRET, 0, 0, -1, 128);
+	m_add_id(p_lka, relay->id);
+	m_add_string(p_lka, relay->authtable);
+	m_add_string(p_lka, relay->authlabel);
+	m_close(p_lka);
+
 	mta_relay_ref(relay);
 }
 
 static void
 mta_query_preference(struct mta_relay *relay)
 {
+	if (relay->status & RELAY_WAIT_PREFERENCE)
+		return;
 
 	log_debug("debug: mta_query_preference(%s)", mta_relay_to_text(relay));
 
@@ -581,13 +661,13 @@ mta_query_preference(struct mta_relay *relay)
 static void
 mta_query_source(struct mta_relay *relay)
 {
-	struct lka_source_req_msg	req;
-
 	log_debug("debug: mta_query_source(%s)", mta_relay_to_text(relay));
 
-	req.reqid = relay->id;
-	strlcpy(req.tablename, relay->sourcetable, sizeof(req.tablename));
-	m_compose(p_lka, IMSG_LKA_SOURCE, 0, 0, -1, &req, sizeof(req));
+	m_create(p_lka, IMSG_LKA_SOURCE, 0, 0, -1, 64);
+	m_add_id(p_lka, relay->id);
+	m_add_string(p_lka, relay->sourcetable);
+	m_close(p_lka);
+
 	tree_xset(&wait_source, relay->id, relay);
 	relay->status |= RELAY_WAIT_SOURCE;
 	mta_relay_ref(relay);
@@ -627,7 +707,7 @@ mta_on_mx(void *tag, void *arg, void *data)
 	}
 
 	if (domain->mxstatus)
-		log_info("smtp-out: Failed to resolve MX for relay %s: %s",
+		log_info("smtp-out: Failed to resolve MX for %s: %s",
 		    mta_relay_to_text(relay), relay->failstr);
 
 	relay->status &= ~RELAY_WAIT_MX;
@@ -638,94 +718,168 @@ mta_on_mx(void *tag, void *arg, void *data)
 static void
 mta_on_source(struct mta_relay *relay, struct mta_source *source)
 {
+	mta_connector(relay, source);
+}
+
+static void
+mta_connect(struct mta_connector *c)
+{
 	struct mta_route	*route;
-	uint64_t		 id;
 
-	log_debug("debug: mta_on_source(%s, %s)",
-	    mta_relay_to_text(relay), mta_source_to_text(source));
+	log_debug("debug: mta_connect() for %s", mta_connector_to_text(c));
 
-	/* Give up right away if the relay is already failing */
-	if (relay->fail) {
-		log_debug("debug: mta: relay is failing, giving up");
-		mta_source_unref(source); /* from IMSG_LKA_SOURCE */
+	route = mta_find_route(c);
+	if (route == NULL) {
+		mta_recycle(c);
+		if (c->queue == &c->relay->c_limit)
+			c->clearlimit = time(NULL) + CONNECTOR_DELAY_LIMIT;
+		if (c->queue == &c->relay->c_ready)
+			fatalx("connector with no route ended up in ready list");
 		return;
 	}
 
-	id = ptoid(source);
-	if (tree_check(&relay->source_fail, id)) {
-		/*
-		 * If this source has been tried already, and there is no
-		 * active connection (which would mean that a source was found
-		 * to be useable), assume we looped over all available source
-		 * addresses, and all of them failed.
-		 */
-		log_debug("debug: mta: source already tried");
-		if (relay->nconn == 0) {
-			relay->fail = IMSG_DELIVERY_TEMPFAIL;
-			relay->failstr = "Could not find a valid source address";
-		}
-		mta_source_unref(source); /* from IMSG_LKA_SOURCE */
-		return;
-	}
+	c->nconn += 1;
+	c->lastconn = time(NULL);
+	c->nextconn = c->lastconn + CONNECTOR_DELAY_CONNECT;
 
-	route = mta_find_route(relay, source);
-	if (route) {
-		mta_source_unref(source); /* transfered to mta_route() */
-		mta_relay_ref(relay);
-		relay->nconn += 1;
-		relay->lastconn = time(NULL);
-		route->nconn += 1;
-		route->lastconn = relay->lastconn;
-		route->src->nconn += 1;
-		route->src->lastconn = relay->lastconn;
-		route->dst->nconn += 1;
-		route->dst->lastconn = relay->lastconn;
-		mta_session(relay, route);
-		return;
+	c->relay->nconn += 1;
+	c->relay->lastconn = c->lastconn;
+	route->nconn += 1;
+	route->lastconn = c->lastconn;
+	route->src->nconn += 1;
+	route->src->lastconn = c->lastconn;
+	route->dst->nconn += 1;
+	route->dst->lastconn = c->lastconn;
+
+	mta_recycle(c);
+
+	mta_relay_ref(c->relay);
+	mta_session(c->relay, route);	/* this never fails synchronously */
+}
+
+static void
+mta_recycle(struct mta_connector *c)
+{
+	TAILQ_REMOVE(c->queue, c, lst_entry);
+
+	if (c->flags & CONNECTOR_ERROR) {
+		log_debug("debug: mta: putting %s on error queue",
+		    mta_connector_to_text(c));
+		c->queue = &c->relay->c_error;
+	}
+	else if (c->flags & CONNECTOR_LIMIT) {
+		log_debug("debug: mta: putting %s on limit queue",
+		    mta_connector_to_text(c));
+		c->queue = &c->relay->c_limit;
+	}
+	else if (c->nextconn > time(NULL)) {
+		log_debug("debug: mta: putting %s on delay queue",
+		    mta_connector_to_text(c));
+		c->queue = &c->relay->c_delay;
 	}
 	else {
-		mta_source_unref(source); /* from IMSG_LKA_SOURCE */
+		log_debug("debug: mta: putting %s on ready queue",
+		    mta_connector_to_text(c));
+		c->queue = &c->relay->c_ready;
 	}
+
+	TAILQ_INSERT_TAIL(c->queue, c, lst_entry);
+}
+
+static void
+mta_relay_timeout(int fd, short ev, void *arg)
+{
+	struct mta_relay	*r = arg;
+	struct mta_connector	*c;
+	time_t			 t;
+
+	log_debug("debug: mta: timeout for %s", mta_relay_to_text(r));
+
+	t = time(NULL);
+
+	/*
+	 * Clear the limit flags on all connectors.
+	 */
+	while ((c = TAILQ_FIRST(&r->c_limit))) {
+		/* This requires that the list is always sorted */
+		if (c->clearlimit > t)
+			break;
+		log_debug("debug: mta: clearing limits on %s",
+		    mta_connector_to_text(c));
+		c->flags &= ~CONNECTOR_LIMIT;
+		mta_recycle(c);
+	}
+
+	while ((c = TAILQ_FIRST(&r->c_delay))) {
+		/* This requires that the list is always sorted */
+		if (c->nextconn > t)
+			break;
+		log_debug("debug: mta: delay expired for %s",
+		    mta_connector_to_text(c));
+		mta_recycle(c);
+	}
+
+	mta_drain(r);
+	mta_relay_unref(r); /* from mta_relay_schedule() */
+}
+
+static void
+mta_relay_schedule(struct mta_relay *r, unsigned int delay)
+{
+	struct timeval	tv;
+
+	if (evtimer_pending(&r->ev, &tv))
+		return;
+
+	log_debug("debug: mta: adding relay timeout: %u", delay);
+
+	tv.tv_sec = delay;
+	tv.tv_usec = 0;
+	evtimer_add(&r->ev, &tv);
+	mta_relay_ref(r);
 }
 
 static void
 mta_drain(struct mta_relay *r)
 {
-	char buf[64];
+	struct mta_connector	*c;
+	struct mta_source	*s;
+	char			 buf[64];
 
-	log_debug("debug: mta: draining relay %s "
-	    "(refcount=%i, ntask=%zu, nconn=%zu)", 
-	    mta_relay_to_text(r), r->refcount, r->ntask, r->nconn);
-
-	mta_relay_ref(r);
+	log_debug("debug: mta: draining %s "
+	    "refcount=%i, ntask=%zu, nconnector=%zu, nconn=%zu", 
+	    mta_relay_to_text(r),
+	    r->refcount, r->ntask, r->nconnector, r->nconn);
 
 	/*
-	 * If we know that this relay is failing and there are no session
-	 * currently running, flush the tasks.
+	 * All done.
 	 */
-	if (r->fail && r->nconn == 0) {
-		mta_flush(r, r->fail, r->failstr);
-		goto done;
+	if (r->ntask == 0) {
+		log_debug("debug: mta: all done for %s", mta_relay_to_text(r));
+		return;
 	}
 
-	/* Query secret if needed */
-	if (r->flags & RELAY_AUTH && r->secret == NULL &&
-	    !(r->status & RELAY_WAIT_SECRET))
+	/*
+	 * If we know that this relay is failing flush the tasks.
+	 */
+	if (r->fail) {
+		mta_flush(r, r->fail, r->failstr);
+		return;
+	}
+
+	/* Query secret if needed. */
+	if (r->flags & RELAY_AUTH && r->secret == NULL)
 		mta_query_secret(r);
 
-	/* Query our preference if needed */
-	if (r->backupname && r->backuppref == -1 && !(r->status & RELAY_WAIT_PREFERENCE))
+	/* Query our preference if needed. */
+	if (r->backupname && r->backuppref == -1)
 		mta_query_preference(r);
 
-	/* Query the domain MXs if needed */
-	if (r->domain->lastmxquery == 0 && !(r->status & RELAY_WAIT_MX)) {
-		if (waitq_wait(&r->domain->mxs, mta_on_mx, r))
-			mta_query_mx(r->domain);
-		r->status |= RELAY_WAIT_MX;
-		mta_relay_ref(r);
-	}
+	/* Query the domain MXs if needed. */
+	if (r->domain->lastmxquery == 0)
+		mta_query_mx(r);
 
-	/* Wait until we are ready to proceed */
+	/* Wait until we are ready to proceed. */
 	if (r->status & RELAY_WAITMASK) {
 		buf[0] = '\0';
 		if (r->status & RELAY_WAIT_MX)
@@ -736,61 +890,98 @@ mta_drain(struct mta_relay *r)
 			strlcat(buf, "secret ", sizeof buf);
 		if (r->status & RELAY_WAIT_SOURCE)
 			strlcat(buf, "source ", sizeof buf);
-		log_debug("debug: mta: relay %s waiting for %s",
+		log_debug("debug: mta: %s waiting for %s",
 		    mta_relay_to_text(r), buf);
-		goto done;
-	}
-
-	if (r->ntask == 0) {
-		log_debug("debug: mta: all done for relay %s",
-		    mta_relay_to_text(r));
-		goto done;
+		return;
 	}
 
 	/*
-	 * Relay is failing, but there are sessions running
+	 * Start new connections if possible.
+	 * XXX find a better heuristic for the good number of connections
+	 * depending on the number of tasks and other factors.  We might
+	 * want to try more than the number of task, to have a chance to
+	 * hit a mx faster if the first ones timeout.
 	 */
-	if (r->fail) {
-		log_debug("debug: mta: relay %s is failing, but has sessions",
-		    mta_relay_to_text(r));
-		goto done;
-	}
+	while (r->nconn < r->ntask) {
+		log_debug("debug: mta: trying to create new connection: "
+		    "refcount=%i, ntask=%zu, nconnector=%zu, nconn=%zu", 
+		    r->refcount, r->ntask, r->nconnector, r->nconn);
 
-	/*
-	 * Create new sessions if possible/necessary.
-	 */
-	while (r->nconn < r->ntask && r->fail == 0 && !r->limit_hit) {
-
+		/* Check the per-relay connection limit */
 		if (r->nconn >= MAXCONN_PER_RELAY) {
-			log_info("smtp-out: Hit connection limit on relay %s",
+			log_debug("debug: mta: hit connection limit on %s",
 			    mta_relay_to_text(r));
-			r->limit_hit = 1;
-			goto done;
+			return;
 		}
 
+		/* Use the first connector if ready */
+		c = TAILQ_FIRST(&r->c_ready);
+		if (c) {
+			log_debug("debug: mta: using connector %s",
+			    mta_connector_to_text(c));
+			r->sourceloop = 0;
+			mta_connect(c);
+			continue;
+		}
+
+		/* No new connectors */
+		if (r->sourceloop > r->nconnector) {
+			log_debug("debug: mta: no new connector available");
+
+			if (TAILQ_FIRST(&r->c_delay)) {
+				mta_relay_schedule(r, 1);
+				log_debug(
+				    "debug: mta: waiting for relay timeout");
+				return;
+			}
+
+			if (TAILQ_FIRST(&r->c_limit)) {
+				mta_relay_schedule(r, 5);
+				log_debug(
+				    "debug: mta: waiting for relay timeout");
+				return;
+			}
+
+			log_debug("debug: mta: failing...");
+			/*
+			 * All sources have been tried and no connectors can
+			 * be used.
+			 */
+			if (r->nconnector == 0) {
+				r->fail = IMSG_DELIVERY_TEMPFAIL;
+				r->failstr = "No source address";
+			}
+			else {
+				r->fail = IMSG_DELIVERY_TEMPFAIL;
+				r->failstr = "No MX could be reached";
+			}
+			mta_flush(r, r->fail, r->failstr);
+			return;
+		}
+
+		r->sourceloop++;
+		log_debug("debug: mta: need new connector (attempt %zu)",
+			r->sourceloop);
 		if (r->sourcetable) {
+			log_debug("debug: mta: querying source %s",
+			    r->sourcetable);
 			mta_query_source(r);
-			goto done;
+			return;
 		}
-		else
-			mta_on_source(r, mta_source(NULL));
+		log_debug("debug: mta: using default source");
+		s = mta_source(NULL);
+		mta_on_source(r, s);
+		mta_source_unref(s);
 	}
-
-	if (r->nconn == 0 && r->ntask && r->fail)
-		mta_drain(r);
-
-    done:
-	mta_relay_unref(r); /* from here */
 }
 
 static void
 mta_flush(struct mta_relay *relay, int fail, const char *error)
 {
-	struct envelope	*e;
-	struct mta_task	*task;
-	const char	*pfx;
-	char		 buf[MAX_LINE_SIZE];
-	size_t		 n;
+	struct mta_envelope	*e;
+	struct mta_task		*task;
+	const char		*pfx;
+	size_t			 n;
 
 	log_debug("debug: mta_flush(%s, %i, \"%s\")",
 	    mta_relay_to_text(relay), fail, error);
@@ -802,19 +993,18 @@ mta_flush(struct mta_relay *relay, int fail, const char *error)
 	else
 		errx(1, "unexpected delivery status %i", fail);
 
-	snprintf(buf, sizeof buf, "relay=%s, ", relay->domain->name);
-
 	n = 0;
 	while ((task = TAILQ_FIRST(&relay->tasks))) {
 		TAILQ_REMOVE(&relay->tasks, task, entry);
 		while ((e = TAILQ_FIRST(&task->envelopes))) {
 			TAILQ_REMOVE(&task->envelopes, e, entry);
-			envelope_set_errormsg(e, "%s", error);
-			log_envelope(e, buf, pfx, e->errorline);
-			m_compose(p_queue, fail, 0, 0, -1, e, sizeof(*e));
+			mta_delivery(e, relay->domain->name, fail, error);
+			free(e->dest);
+			free(e->rcpt);
 			free(e);
 			n++;
 		}
+		free(task->sender);
 		free(task);
 	}
 
@@ -824,10 +1014,10 @@ mta_flush(struct mta_relay *relay, int fail, const char *error)
 }
 
 /*
- * Find a route to use for this relay with the given source.
+ * Find a route to use for this connector
  */
 static struct mta_route *
-mta_find_route(struct mta_relay *relay, struct mta_source *source)
+mta_find_route(struct mta_connector *c)
 {
 	struct mta_route	*route, *best;
 	struct mta_mx		*mx;
@@ -841,7 +1031,14 @@ mta_find_route(struct mta_relay *relay, struct mta_source *source)
 	best = NULL;
 	seen = 0;
 
-	TAILQ_FOREACH(mx, &relay->domain->mxs, entry) {
+	if (c->nconn >= MAXCONN_PER_CONNECTOR) {
+		log_debug("debug: mta: hit limit on connector %s",
+		    mta_connector_to_text(c));
+		c->flags |= CONNECTOR_LIMIT_SOURCE;
+		return (NULL);
+	}
+
+	TAILQ_FOREACH(mx, &c->relay->domain->mxs, entry) {
 		/*
 		 * New preference level
 		 */		
@@ -864,8 +1061,8 @@ mta_find_route(struct mta_relay *relay, struct mta_source *source)
 			 *  If we are a backup MX, do not relay to MXs with
 			 *  a greater preference value.
 			 */
-			if (relay->backuppref >= 0 &&
-			    mx->preference >= relay->backuppref)
+			if (c->relay->backuppref >= 0 &&
+			    mx->preference >= c->relay->backuppref)
 				break;
 
 			/*
@@ -881,18 +1078,18 @@ mta_find_route(struct mta_relay *relay, struct mta_source *source)
 		/* Found a possibly valid mx */
 		seen++;
 
+		if (c->source->sa &&
+		    c->source->sa->sa_family != mx->host->sa->sa_family) {
+			family_mismatch = 1;
+			continue;
+		}
+
 		if (mx->host->nconn >= MAXCONN_PER_HOST) {
 			limit_host = 1;
 			continue;
 		}
 
-		if (source->sa &&
-		    source->sa->sa_family != mx->host->sa->sa_family) {
-			family_mismatch = 1;
-			continue;
-		}
-
-		route = mta_route(source, mx->host);
+		route = mta_route(c->source, mx->host);
 
 		if (route->nconn >= MAXCONN_PER_ROUTE) {
 			limit_route = 1;
@@ -914,52 +1111,55 @@ mta_find_route(struct mta_relay *relay, struct mta_source *source)
 	if (best)
 		return (best);
 
-	if (family_mismatch) {
-		log_debug("debug: mta: Address family mismatch for relay %s",
-		    mta_relay_to_text(relay));
-
-		/* Remember that this route is not useable */
-		mta_source_ref(source);
-		tree_xset(&relay->source_fail, ptoid(source), source);
-		return (NULL);
+	if (seen == 0) {
+		log_info("smtp-out: No reachable MX for connector %s",
+		    mta_connector_to_text(c));
+		c->flags |= CONNECTOR_MX_ERROR;
 	}
-
-	/*
-	 * XXX this is not really correct, since we could be hitting a limit
-	 * because of another relay, and we might never have a chance to
-	 * reset the limit. What we should is put ourself on a waitq for
-	 * that resource and reset+drain when that resource is possibly
-	 * available.
-	 */
-	if (limit_host) {
-		log_info("smtp-out: Hit host limit on relay %s",
-		    mta_relay_to_text(relay));
-		relay->limit_hit = 1;
+	else if (family_mismatch) {
+		log_info("smtp-out: Address family mismatch on connector %s",
+		    mta_connector_to_text(c));
+		c->flags |= CONNECTOR_FAMILY_ERROR;
 	}
-	if (limit_route) {
-		log_info("smtp-out: Hit route limit on relay %s",
-		    mta_relay_to_text(relay));
-		relay->limit_hit = 1;
+	else if (limit_route) {
+		log_debug("debug: mta: hit route limit on connector %s",
+		    mta_connector_to_text(c));
+		c->flags |= CONNECTOR_LIMIT_ROUTE;
 	}
-	/*
-	 * No reachable MX for this relay with this source.
-	 * XXX Not until we tried all possible sources, and this might 
-	 * change when limits are reset.
-	 */
-	if (relay->nconn == 0 || seen == 0) {
-		log_info("smtp-out: No reachable MX for relay %s",
-		    mta_relay_to_text(relay));
-		relay->fail = IMSG_DELIVERY_TEMPFAIL;
-		relay->failstr = "No MX could be reached";
+	else if (limit_host) {
+		log_debug("debug: mta: hit host limit on connector %s",
+		    mta_connector_to_text(c));
+		c->flags |= CONNECTOR_LIMIT_HOST;
 	}
 
 	return (NULL);
 }
 
+static void
+mta_log(const struct mta_envelope *evp, const char *prefix, const char *relay,
+    const char *status)
+{
+	char rcpt[MAX_LINE_SIZE];
+
+	rcpt[0] = '\0';
+	if (evp->rcpt)
+		snprintf(rcpt, sizeof rcpt, "rcpt=<%s>, ", evp->rcpt);
+
+	log_info("relay: %s for %016" PRIx64 ": from=<%s>, to=<%s>, "
+	    "%srelay=%s delay=%s, stat=%s",
+	    prefix,
+	    evp->id,
+	    evp->task->sender,
+	    evp->dest,
+	    rcpt,
+	    relay,
+	    duration_to_text(time(NULL) - evp->creation),
+	    status);
+}
+
 static struct mta_relay *
 mta_relay(struct envelope *e)
 {
-	struct ssl		 ssl;
 	struct mta_relay	 key, *r;
 
 	bzero(&key, sizeof key);
@@ -988,11 +1188,17 @@ mta_relay(struct envelope *e)
 	key.sourcetable = e->agent.mta.relay.sourcetable;
 	if (!key.sourcetable[0])
 		key.sourcetable = NULL;
+	key.helotable = e->agent.mta.relay.helotable;
+	if (!key.helotable[0])
+		key.helotable = NULL;
 
 	if ((r = SPLAY_FIND(mta_relay_tree, &relays, &key)) == NULL) {
 		r = xcalloc(1, sizeof *r, "mta_relay");
 		TAILQ_INIT(&r->tasks);
-		tree_init(&r->source_fail);
+		TAILQ_INIT(&r->c_ready);
+		TAILQ_INIT(&r->c_delay);
+		TAILQ_INIT(&r->c_limit);
+		TAILQ_INIT(&r->c_error);
 		r->id = generate_uid();
 		r->flags = key.flags;
 		r->domain = key.domain;
@@ -1005,20 +1211,19 @@ mta_relay(struct envelope *e)
 			r->authtable = xstrdup(key.authtable, "mta: authtable");
 		if (key.authlabel)
 			r->authlabel = xstrdup(key.authlabel, "mta: authlabel");
-		if (r->cert) {
-			strlcpy(ssl.ssl_name, r->cert, sizeof(ssl.ssl_name));
-			r->ssl = SPLAY_FIND(ssltree, env->sc_ssl, &ssl);
-		}
 		if (key.sourcetable)
 			r->sourcetable = xstrdup(key.sourcetable,
 			    "mta: sourcetable");
+		if (key.helotable)
+			r->helotable = xstrdup(key.helotable,
+			    "mta: helotable");
 		SPLAY_INSERT(mta_relay_tree, &relays, r);
-		log_trace(TRACE_MTA, "mta: new relay %s", mta_relay_to_text(r));
+		evtimer_set(&r->ev, mta_relay_timeout, r);
+		log_trace(TRACE_MTA, "mta: new %s", mta_relay_to_text(r));
 		stat_increment("mta.relay", 1);
 	} else {
 		mta_domain_unref(key.domain); /* from here */
-		log_trace(TRACE_MTA, "mta: reusing relay %s",
-		    mta_relay_to_text(r));
+		log_trace(TRACE_MTA, "mta: reusing %s", mta_relay_to_text(r));
 	}
 
 	r->refcount++;
@@ -1034,12 +1239,12 @@ mta_relay_ref(struct mta_relay *r)
 static void
 mta_relay_unref(struct mta_relay *relay)
 {
-	struct mta_source	*source;
+	struct mta_connector	*c;
 
 	if (--relay->refcount)
 		return;
 
-	log_debug("debug: mta: freeing relay %s", mta_relay_to_text(relay));
+	log_debug("debug: mta: freeing %s", mta_relay_to_text(relay));
 	SPLAY_REMOVE(mta_relay_tree, &relays, relay);
 	if (relay->cert)
 		free(relay->cert);
@@ -1048,8 +1253,11 @@ mta_relay_unref(struct mta_relay *relay)
 	if (relay->authlabel)
 		free(relay->authlabel);
 
-	while (tree_poproot(&relay->source_fail, NULL, (void**)&source))
-		mta_source_unref(source); /* from mta_on_source() */
+	while ((tree_poproot(&relay->connectors, NULL, (void**)&c)))
+		mta_connector_free(c);
+
+	if (evtimer_pending(&relay->ev, NULL))
+		evtimer_del(&relay->ev);
 
 	mta_domain_unref(relay->domain); /* from constructor */
 	free(relay);
@@ -1061,31 +1269,28 @@ mta_relay_to_text(struct mta_relay *relay)
 {
 	static char	 buf[1024];
 	char		 tmp[32];
-	const char	*sep = "";
+	const char	*sep = ",";
 
-	snprintf(buf, sizeof buf, "%s[", relay->domain->name);
+	snprintf(buf, sizeof buf, "[relay:%s", relay->domain->name);
 
 	if (relay->port) {
+		strlcat(buf, sep, sizeof buf);
 		snprintf(tmp, sizeof tmp, "port=%i", (int)relay->port);
 		strlcat(buf, tmp, sizeof buf);
-		sep = ",";
 	}
 
 	if (relay->flags & RELAY_STARTTLS) {
 		strlcat(buf, sep, sizeof buf);
-		sep = ",";
 		strlcat(buf, "starttls", sizeof buf);
 	}
 
 	if (relay->flags & RELAY_SMTPS) {
 		strlcat(buf, sep, sizeof buf);
-		sep = ",";
 		strlcat(buf, "smtps", sizeof buf);
 	}
 
 	if (relay->flags & RELAY_AUTH) {
 		strlcat(buf, sep, sizeof buf);
-		sep = ",";
 		strlcat(buf, "auth=", sizeof buf);
 		strlcat(buf, relay->authtable, sizeof buf);
 		strlcat(buf, ":", sizeof buf);
@@ -1094,14 +1299,12 @@ mta_relay_to_text(struct mta_relay *relay)
 
 	if (relay->cert) {
 		strlcat(buf, sep, sizeof buf);
-		sep = ",";
 		strlcat(buf, "cert=", sizeof buf);
 		strlcat(buf, relay->cert, sizeof buf);
 	}
 
 	if (relay->flags & RELAY_MX) {
 		strlcat(buf, sep, sizeof buf);
-		sep = ",";
 		strlcat(buf, "mx", sizeof buf);
 	}
 
@@ -1217,10 +1420,10 @@ mta_host_to_text(struct mta_host *h)
 	static char buf[1024];
 
 	if (h->ptrname)
-		snprintf(buf, sizeof buf, "%s [%s]",
-		    h->ptrname, sa_to_text(h->sa));
+		snprintf(buf, sizeof buf, "%s (%s)",
+		    sa_to_text(h->sa), h->ptrname);
 	else
-		snprintf(buf, sizeof buf, "[%s]", sa_to_text(h->sa));
+		snprintf(buf, sizeof buf, "%s", sa_to_text(h->sa));
 
 	return (buf);
 }
@@ -1259,11 +1462,13 @@ mta_domain(char *name, int flags)
 	return (d);
 }
 
+#if 0
 static void
 mta_domain_ref(struct mta_domain *d)
 {
 	d->refcount++;
 }
+#endif
 
 static void
 mta_domain_unref(struct mta_domain *d)
@@ -1345,7 +1550,7 @@ mta_source_to_text(struct mta_source *s)
 
 	if (s->sa == NULL)
 		return "[]";
-	snprintf(buf, sizeof buf, "[%s]", sa_to_text(s->sa));
+	snprintf(buf, sizeof buf, "%s", sa_to_text(s->sa));
 	return (buf);
 }
 
@@ -1364,6 +1569,49 @@ mta_source_cmp(const struct mta_source *a, const struct mta_source *b)
 }
 
 SPLAY_GENERATE(mta_source_tree, mta_source, entry, mta_source_cmp);
+
+static struct mta_connector *
+mta_connector(struct mta_relay *relay, struct mta_source *source)
+{
+	struct mta_connector	*c;
+
+	c = tree_get(&relay->connectors, (uintptr_t)(source));
+	if (c == NULL) {
+		c = xcalloc(1, sizeof(*c), "mta_connector");
+		c->relay = relay;
+		c->source = source;
+		mta_source_ref(source);
+		c->queue = &relay->c_ready;
+		TAILQ_INSERT_HEAD(c->queue, c, lst_entry);
+		tree_xset(&relay->connectors, (uintptr_t)(source), c);
+		relay->nconnector++;
+		stat_increment("mta.connector", 1);
+		log_debug("debug: mta: new connector %s",
+		    mta_connector_to_text(c));
+	}
+
+	return (c);
+}
+
+static void
+mta_connector_free(struct mta_connector *c)
+{
+	c->relay->nconnector--;
+	TAILQ_REMOVE(c->queue, c, lst_entry);
+	mta_source_unref(c->source);
+	stat_decrement("mta.connector", 1);
+}
+
+static const char *
+mta_connector_to_text(struct mta_connector *c)
+{
+	static char buf[1024];
+
+	snprintf(buf, sizeof buf, "%s->%s",
+	    mta_source_to_text(c->source),
+	    mta_relay_to_text(c->relay));
+	return (buf);
+}
 
 static struct mta_route *
 mta_route(struct mta_source *src, struct mta_host *dst)
@@ -1388,11 +1636,13 @@ mta_route(struct mta_source *src, struct mta_host *dst)
 	return (r);
 }
 
+#if 0
 static void
 mta_route_ref(struct mta_route *r)
 {
 	r->refcount++;
 }
+#endif
 
 static void
 mta_route_unref(struct mta_route *r)
@@ -1411,7 +1661,7 @@ mta_route_to_text(struct mta_route *r)
 {
 	static char	buf[1024];
 
-	snprintf(buf, sizeof buf, "%s <--> %s",
+	snprintf(buf, sizeof buf, "%s <-> %s",
 	    mta_source_to_text(r->src),
 	    mta_host_to_text(r->dst));
 

@@ -1,7 +1,7 @@
-/*	$OpenBSD: ruleset.c,v 1.26 2012/11/12 14:58:53 eric Exp $ */
+/*	$OpenBSD: ruleset.c,v 1.27 2013/01/26 09:37:23 gilles Exp $ */
 
 /*
- * Copyright (c) 2009 Gilles Chehade <gilles@openbsd.org>
+ * Copyright (c) 2009 Gilles Chehade <gilles@poolp.org>
  *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -35,26 +35,32 @@
 
 
 static int ruleset_check_source(struct table *,
-    const struct sockaddr_storage *);
+    const struct sockaddr_storage *, int);
+static int ruleset_check_sender(struct table *, const struct mailaddr *);
 
 struct rule *
 ruleset_match(const struct envelope *evp)
 {
-	const struct mailaddr *maddr = &evp->dest;
-	const struct sockaddr_storage *ss = &evp->ss;
-	struct rule	*r;
-	int		 ret;
-
-	if (evp->flags & EF_INTERNAL)
-		ss = NULL;
+	const struct mailaddr		*maddr = &evp->dest;
+	const struct sockaddr_storage	*ss = &evp->ss;
+	struct rule			*r;
+	int				 ret;
 
 	TAILQ_FOREACH(r, env->sc_rules, r_entry) {
 
 		if (r->r_tag[0] != '\0' && strcmp(r->r_tag, evp->tag) != 0)
 			continue;
 
-		if (ss != NULL && !(evp->flags & EF_AUTHENTICATED)) {
-			ret = ruleset_check_source(r->r_sources, ss);
+		ret = ruleset_check_source(r->r_sources, ss, evp->flags);
+		if (ret == -1) {
+			errno = EAGAIN;
+			return (NULL);
+		}
+		if (ret == 0)
+			continue;
+
+		if (r->r_senders) {
+			ret = ruleset_check_sender(r->r_senders, &evp->sender);
 			if (ret == -1) {
 				errno = EAGAIN;
 				return (NULL);
@@ -91,19 +97,39 @@ matched:
 }
 
 static int
-ruleset_check_source(struct table *table, const struct sockaddr_storage *ss)
+ruleset_check_source(struct table *table, const struct sockaddr_storage *ss,
+    int evpflags)
 {
 	const char   *key;
 
-	if (ss == NULL) {
-		/* This happens when caller is part of an internal
-		 * lookup (ie: alias resolved to a remote address)
-		 */
+	if (evpflags & (EF_AUTHENTICATED | EF_INTERNAL))
+		key = "local";
+	else
+		key = ss_to_text(ss);
+	switch (table_lookup(table, key, K_NETADDR, NULL)) {
+	case 1:
 		return 1;
+	case -1:
+		log_warnx("warn: failure to perform a table lookup on table %s",
+		    table->t_name);
+		return -1;
+	default:
+		break;
 	}
 
-	key = ss->ss_family == AF_LOCAL ? "local" : ss_to_text(ss);
-	switch (table_lookup(table, key, K_NETADDR, NULL)) {
+	return 0;
+}
+
+static int
+ruleset_check_sender(struct table *table, const struct mailaddr *maddr)
+{
+	const char	*key;
+
+	key = mailaddr_to_text(maddr);
+	if (key == NULL)
+		return -1;
+
+	switch (table_lookup(table, key, K_MAILADDR, NULL)) {
 	case 1:
 		return 1;
 	case -1:

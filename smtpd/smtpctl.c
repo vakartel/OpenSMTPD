@@ -1,6 +1,7 @@
-/*	$OpenBSD: smtpctl.c,v 1.95 2012/11/12 14:58:53 eric Exp $	*/
+/*	$OpenBSD: smtpctl.c,v 1.101 2013/02/14 12:30:49 gilles Exp $	*/
 
 /*
+ * Copyright (c) 2006 Gilles Chehade <gilles@poolp.org>
  * Copyright (c) 2006 Pierre-Yves Ritschard <pyr@openbsd.org>
  * Copyright (c) 2005 Claudio Jeker <claudio@openbsd.org>
  * Copyright (c) 2004, 2005 Esben Norby <norby@openbsd.org>
@@ -65,6 +66,8 @@ static int action_schedule_all(void);
 
 static int action_show_queue(void);
 static int action_show_queue_message(uint32_t);
+static uint32_t trace_convert(uint32_t);
+static uint32_t profile_convert(uint32_t);
 
 int proctype;
 struct imsgbuf	*ibuf;
@@ -76,6 +79,7 @@ struct smtpd	*env = NULL;
 
 time_t now;
 
+struct queue_backend queue_backend_null;
 struct queue_backend queue_backend_ram;
 
 __dead void
@@ -95,8 +99,6 @@ usage(void)
 static void
 setup_env(struct smtpd *smtpd)
 {
-	struct passwd	*pwq;
-
 	bzero(smtpd, sizeof (*smtpd));
 	env = smtpd;
 
@@ -107,17 +109,13 @@ setup_env(struct smtpd *smtpd)
 
 	env->sc_pwqueue = getpwnam(SMTPD_QUEUE_USER);
 	if (env->sc_pwqueue)
-		pwq = env->sc_pwqueue = pw_dup(env->sc_pwqueue);
+		env->sc_pwqueue = pw_dup(env->sc_pwqueue);
 	else
-		pwq = env->sc_pwqueue = pw_dup(env->sc_pw);
+		env->sc_pwqueue = pw_dup(env->sc_pw);
 	if (env->sc_pwqueue == NULL)
 		err(1, NULL);
 
-	env->sc_queue = queue_backend_lookup("fs");
-	if (env->sc_queue == NULL)
-		errx(1, "could not find queue backend");
-
-	if (!env->sc_queue->init(0))
+	if (!queue_init("fs", 0))
 		errx(1, "invalid directory permissions");
 }
 
@@ -182,7 +180,8 @@ main(int argc, char *argv[])
 	uint64_t		ulval;
 	char			name[MAX_LINE_SIZE];
 	int			done = 0;
-	int			verbose = 0;
+	int			verb = 0;
+	int			profile = 0;
 	int			action = -1;
 
 	/* parse options */
@@ -233,10 +232,8 @@ main(int argc, char *argv[])
 		/* not reached */
 
 	case SCHEDULE:
-		if (! strcmp(res->data, "all")) {
-			action_schedule_all();
-			return;
-		}
+		if (! strcmp(res->data, "all"))
+			return action_schedule_all();
 
 		if ((ulval = text_to_evpid(res->data)) == 0)
 			errx(1, "invalid msgid/evpid");
@@ -283,7 +280,6 @@ main(int argc, char *argv[])
 		done = 1;
 		break;
 	case MONITOR:
-		done = 1;
 		while (1) {
 			imsg_compose(ibuf, IMSG_DIGEST, 0, 0, -1, NULL, 0);
 			flush();
@@ -294,14 +290,69 @@ main(int argc, char *argv[])
 		}
 		break;
 	case LOG_VERBOSE:
-		verbose = 1;
+		verb = TRACE_VERBOSE;
 		/* FALLTHROUGH */
 	case LOG_BRIEF:
-		imsg_compose(ibuf, IMSG_CTL_VERBOSE, 0, 0, -1, &verbose,
-		    sizeof(verbose));
+		imsg_compose(ibuf, IMSG_CTL_VERBOSE, 0, 0, -1, &verb,
+		    sizeof(verb));
 		printf("logging request sent.\n");
 		done = 1;
 		break;
+
+	case LOG_TRACE_IMSG:
+	case LOG_TRACE_IO:
+	case LOG_TRACE_SMTP:
+	case LOG_TRACE_MFA:
+	case LOG_TRACE_MTA:
+	case LOG_TRACE_BOUNCE:
+	case LOG_TRACE_SCHEDULER:
+	case LOG_TRACE_LOOKUP:
+	case LOG_TRACE_STAT:
+	case LOG_TRACE_RULES:
+	case LOG_TRACE_IMSG_SIZE:
+	case LOG_TRACE_EXPAND:
+	case LOG_TRACE_ALL:
+		verb = trace_convert(action);
+		imsg_compose(ibuf, IMSG_CTL_TRACE, 0, 0, -1, &verb,
+		    sizeof(verb));
+		done = 1;
+		break;
+
+	case LOG_UNTRACE_IMSG:
+	case LOG_UNTRACE_IO:
+	case LOG_UNTRACE_SMTP:
+	case LOG_UNTRACE_MFA:
+	case LOG_UNTRACE_MTA:
+	case LOG_UNTRACE_BOUNCE:
+	case LOG_UNTRACE_SCHEDULER:
+	case LOG_UNTRACE_LOOKUP:
+	case LOG_UNTRACE_STAT:
+	case LOG_UNTRACE_RULES:
+	case LOG_UNTRACE_IMSG_SIZE:
+	case LOG_UNTRACE_EXPAND:
+	case LOG_UNTRACE_ALL:
+		verb = trace_convert(action);
+		imsg_compose(ibuf, IMSG_CTL_UNTRACE, 0, 0, -1, &verb,
+		    sizeof(verb));
+		done = 1;
+		break;
+
+	case LOG_PROFILE_IMSG:
+	case LOG_PROFILE_QUEUE:
+		profile = profile_convert(action);
+		imsg_compose(ibuf, IMSG_CTL_PROFILE, 0, 0, -1, &profile,
+		    sizeof(profile));
+		done = 1;
+		break;
+
+	case LOG_UNPROFILE_IMSG:
+	case LOG_UNPROFILE_QUEUE:
+		profile = profile_convert(action);
+		imsg_compose(ibuf, IMSG_CTL_UNPROFILE, 0, 0, -1, &profile,
+		    sizeof(profile));
+		done = 1;
+		break;
+
 	default:
 		errx(1, "unknown request (%d)", action);
 	}
@@ -322,6 +373,36 @@ main(int argc, char *argv[])
 		case RESUME_SMTP:
 		case LOG_VERBOSE:
 		case LOG_BRIEF:
+		case LOG_TRACE_IMSG:
+		case LOG_TRACE_IO:
+		case LOG_TRACE_SMTP:
+		case LOG_TRACE_MFA:
+		case LOG_TRACE_MTA:
+		case LOG_TRACE_BOUNCE:
+		case LOG_TRACE_SCHEDULER:
+		case LOG_TRACE_LOOKUP:
+		case LOG_TRACE_STAT:
+		case LOG_TRACE_RULES:
+		case LOG_TRACE_IMSG_SIZE:
+		case LOG_TRACE_EXPAND:
+		case LOG_TRACE_ALL:
+		case LOG_UNTRACE_IMSG:
+		case LOG_UNTRACE_IO:
+		case LOG_UNTRACE_SMTP:
+		case LOG_UNTRACE_MFA:
+		case LOG_UNTRACE_MTA:
+		case LOG_UNTRACE_BOUNCE:
+		case LOG_UNTRACE_SCHEDULER:
+		case LOG_UNTRACE_LOOKUP:
+		case LOG_UNTRACE_STAT:
+		case LOG_UNTRACE_RULES:
+		case LOG_UNTRACE_IMSG_SIZE:
+		case LOG_UNTRACE_EXPAND:
+		case LOG_UNTRACE_ALL:
+		case LOG_PROFILE_IMSG:
+		case LOG_PROFILE_QUEUE:
+		case LOG_UNPROFILE_IMSG:
+		case LOG_UNPROFILE_QUEUE:
 			done = show_command_output(&imsg);
 			break;
 		case SHOW_STATS:
@@ -660,12 +741,12 @@ show_envelope(const char *s)
 	if ((evpid = text_to_evpid(s)) == 0)
 		errx(1, "invalid msgid/evpid");
 
-	if (! bsnprintf(buf, sizeof(buf), "%s%s/%02x/%08x%s/%016" PRIx64,
-	    PATH_SPOOL,
-	    PATH_QUEUE,
-	    evpid_to_msgid(evpid) & 0xff,
-	    evpid_to_msgid(evpid),
-	    PATH_ENVELOPES, evpid))
+	if (! bsnprintf(buf, sizeof(buf), "%s%s/%02x/%08x/%016" PRIx64,
+		PATH_SPOOL,
+		PATH_QUEUE,
+		(evpid_to_msgid(evpid) & 0xff000000) >> 24,
+		evpid_to_msgid(evpid),
+		evpid))
 		errx(1, "unable to retrieve envelope");
 
 	display(buf);
@@ -739,4 +820,80 @@ show_monitor(struct stat_digest *d)
 
 	last = *d;
 	count++;
+}
+
+static uint32_t
+trace_convert(uint32_t trace)
+{
+	switch (trace) {
+	case LOG_TRACE_IMSG:
+	case LOG_UNTRACE_IMSG:
+		return TRACE_IMSG;
+
+	case LOG_TRACE_IO:
+	case LOG_UNTRACE_IO:
+		return TRACE_IO;
+
+	case LOG_TRACE_SMTP:
+	case LOG_UNTRACE_SMTP:
+		return TRACE_SMTP;
+
+	case LOG_TRACE_MFA:
+	case LOG_UNTRACE_MFA:
+		return TRACE_MFA;
+
+	case LOG_TRACE_MTA:
+	case LOG_UNTRACE_MTA:
+		return TRACE_MTA;
+
+	case LOG_TRACE_BOUNCE:
+	case LOG_UNTRACE_BOUNCE:
+		return TRACE_BOUNCE;
+
+	case LOG_TRACE_SCHEDULER:
+	case LOG_UNTRACE_SCHEDULER:
+		return TRACE_SCHEDULER;
+
+	case LOG_TRACE_LOOKUP:
+	case LOG_UNTRACE_LOOKUP:
+		return TRACE_LOOKUP;
+
+	case LOG_TRACE_STAT:
+	case LOG_UNTRACE_STAT:
+		return TRACE_STAT;
+
+	case LOG_TRACE_RULES:
+	case LOG_UNTRACE_RULES:
+		return TRACE_RULES;
+
+	case LOG_TRACE_IMSG_SIZE:
+	case LOG_UNTRACE_IMSG_SIZE:
+		return TRACE_IMSGSIZE;
+
+	case LOG_TRACE_EXPAND:
+	case LOG_UNTRACE_EXPAND:
+		return TRACE_EXPAND;
+
+	case LOG_TRACE_ALL:
+	case LOG_UNTRACE_ALL:
+		return ~TRACE_VERBOSE;
+	}
+
+	return 0;
+}
+
+static uint32_t
+profile_convert(uint32_t prof)
+{
+	switch (prof) {
+	case LOG_PROFILE_IMSG:
+	case LOG_UNPROFILE_IMSG:
+		return PROFILE_IMSG;
+
+	case LOG_PROFILE_QUEUE:
+	case LOG_UNPROFILE_QUEUE:
+		return PROFILE_QUEUE;
+	}
+
+	return 0;
 }
