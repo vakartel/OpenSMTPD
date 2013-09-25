@@ -1,4 +1,4 @@
-/*	$OpenBSD: ssl.c,v 1.52 2013/01/26 09:37:24 gilles Exp $	*/
+/*	$OpenBSD$	*/
 
 /*
  * Copyright (c) 2008 Pierre-Yves Ritschard <pyr@openbsd.org>
@@ -21,7 +21,6 @@
 #include <sys/types.h>
 #include <sys/queue.h>
 #include <sys/tree.h>
-#include <sys/param.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 
@@ -29,6 +28,7 @@
 #include <event.h>
 #include <fcntl.h>
 #include <imsg.h>
+#include <limits.h>
 #include <pwd.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -90,6 +90,8 @@ ssl_setup(SSL_CTX **ctxp, struct ssl *ssl)
 		    ssl->ssl_dhparams_len);
 	ssl_set_ephemeral_key_exchange(ctx, dh);
 	DH_free(dh);
+
+	ssl_set_ecdh_curve(ctx);
 
 	*ctxp = ctx;
 	return 1;
@@ -233,74 +235,44 @@ ssl_ctx_create(void)
 }
 
 int
-ssl_load_certfile(struct ssl **sp, const char *path, const char *name, uint8_t flags)
+ssl_load_certificate(struct ssl *s, const char *pathname)
 {
-	struct ssl     *s;
-	char		pathname[PATH_MAX];
-	int		ret;
-
-	if ((s = calloc(1, sizeof(*s))) == NULL)
-		fatal(NULL);
-
-	s->flags = flags;
-	(void)strlcpy(s->ssl_name, name, sizeof(s->ssl_name));
-
-	ret =  snprintf(pathname, sizeof(pathname), "%s/%s.crt",
-	    path ? path : "/etc/ssl", name);
-	if (ret == -1 || (size_t)ret >= sizeof pathname)
-		goto err;
 	s->ssl_cert = ssl_load_file(pathname, &s->ssl_cert_len, 0755);
 	if (s->ssl_cert == NULL)
-		goto err;
+		return 0;
+	return 1;
+}
 
-	ret = snprintf(pathname, sizeof(pathname), "%s/%s.key",
-	    path ? path : "/etc/ssl/private", name);
-	if (ret == -1 || (size_t)ret >= sizeof pathname)
-		goto err;
+int
+ssl_load_keyfile(struct ssl *s, const char *pathname)
+{
 	s->ssl_key = ssl_load_file(pathname, &s->ssl_key_len, 0700);
 	if (s->ssl_key == NULL)
-		goto err;
+		return 0;
+	return 1;
+}
 
-	ret = snprintf(pathname, sizeof(pathname), "%s/%s.ca",
-	    path ? path : "/etc/ssl", name);
-	if (ret == -1 || (size_t)ret >= sizeof pathname)
-		goto err;
+int
+ssl_load_cafile(struct ssl *s, const char *pathname)
+{
 	s->ssl_ca = ssl_load_file(pathname, &s->ssl_ca_len, 0755);
-	if (s->ssl_ca == NULL) {
-		if (errno == EACCES)
-			goto err;
-		log_info("info: No CA found in %s", pathname);
-	}
+	if (s->ssl_ca == NULL)
+		return 0;
+	return 1;
+}
 
-	ret = snprintf(pathname, sizeof(pathname), "%s/%s.dh",
-	    path ? path : "/etc/ssl", name);
-	if (ret == -1 || (size_t)ret >= sizeof pathname)
-		goto err;
+int
+ssl_load_dhparams(struct ssl *s, const char *pathname)
+{
 	s->ssl_dhparams = ssl_load_file(pathname, &s->ssl_dhparams_len, 0755);
 	if (s->ssl_dhparams == NULL) {
 		if (errno == EACCES)
-			goto err;
+			return 0;
 		log_info("info: No DH parameters found in %s: "
 		    "using built-in parameters", pathname);
 	}
-
-	*sp = s;
-	return (1);
-
-err:
-	if (s->ssl_cert != NULL)
-		free(s->ssl_cert);
-	if (s->ssl_key != NULL)
-		free(s->ssl_key);
-	if (s->ssl_ca != NULL)
-		free(s->ssl_ca);
-	if (s->ssl_dhparams != NULL)
-		free(s->ssl_dhparams);
-	if (s != NULL)
-		free(s);
-	return (0);
+	return 1;
 }
-
 
 const char *
 ssl_to_text(const SSL *ssl)
@@ -320,11 +292,8 @@ ssl_error(const char *where)
 {
 	unsigned long	code;
 	char		errbuf[128];
-	extern int	debug;
 
 	for (; (code = ERR_get_error()) != 0 ;) {
-		if (!debug)
-			continue;
 		ERR_error_string_n(code, errbuf, sizeof(errbuf));
 		log_debug("debug: SSL library error: %s: %s", where, errbuf);
 	}
@@ -409,4 +378,27 @@ ssl_set_ephemeral_key_exchange(SSL_CTX *ctx, DH *dh)
 		ssl_error("ssl_set_ephemeral_key_exchange");
 		fatal("ssl_set_ephemeral_key_exchange: cannot set tmp dh");
 	}
+}
+
+void
+ssl_set_ecdh_curve(SSL_CTX *ctx)
+{
+	int	nid;
+	EC_KEY *ecdh;
+
+	if ((nid = OBJ_sn2nid(SSL_ECDH_CURVE)) == 0) {
+		ssl_error("ssl_set_ecdh_curve");
+		fatal("ssl_set_ecdh_curve: unknown curve name "
+		    SSL_ECDH_CURVE);
+	}
+
+	if ((ecdh = EC_KEY_new_by_curve_name(nid)) == NULL) {
+		ssl_error("ssl_set_ecdh_curve");
+		fatal("ssl_set_ecdh_curve: unable to create curve "
+		    SSL_ECDH_CURVE);
+	}
+
+	SSL_CTX_set_tmp_ecdh(ctx, ecdh);
+	SSL_CTX_set_options(ctx, SSL_OP_SINGLE_ECDH_USE);
+	EC_KEY_free(ecdh);
 }

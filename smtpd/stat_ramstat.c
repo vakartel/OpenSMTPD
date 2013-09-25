@@ -1,3 +1,5 @@
+/*	$OpenBSD$	*/
+
 /*
  * Copyright (c) 2012 Gilles Chehade <gilles@poolp.org>
  *
@@ -18,7 +20,6 @@
 #include <sys/socket.h>
 #include <sys/queue.h>
 #include <sys/tree.h>
-#include <sys/param.h>
 
 #include <event.h>
 #include <imsg.h>

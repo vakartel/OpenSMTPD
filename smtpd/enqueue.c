@@ -1,4 +1,4 @@
-/*	$OpenBSD: enqueue.c,v 1.67 2013/01/31 18:34:43 eric Exp $	*/
+/*	$OpenBSD$	*/
 
 /*
  * Copyright (c) 2005 Henning Brauer <henning@bulabula.org>
@@ -18,11 +18,10 @@
  * OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 
-#include <sys/param.h>
+#include <sys/types.h>
 #include <sys/queue.h>
 #include <sys/socket.h>
 #include <sys/tree.h>
-#include <sys/types.h>
 #include <sys/stat.h>
 
 #include <ctype.h>
@@ -31,7 +30,6 @@
 #include <imsg.h>
 #include <inttypes.h>
 #include <pwd.h>
-#include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -44,7 +42,6 @@
 extern struct imsgbuf	*ibuf;
 
 void usage(void);
-static void sighdlr(int);
 static void build_from(char *, struct passwd *);
 static int parse_message(FILE *, int, int, FILE *);
 static void parse_addr(char *, size_t, int);
@@ -54,6 +51,9 @@ static void rcpt_add(char *);
 static int open_connection(void);
 static void get_responses(FILE *, int);
 static int send_line(FILE *, int, char *, ...);
+static int enqueue_offline(int, char *[], FILE *);
+
+extern int srv_connect(void);
 
 enum headerfields {
 	HDR_NONE,
@@ -96,7 +96,7 @@ struct {
 #define WSP(c)			(c == ' ' || c == '\t')
 
 int	  verbose = 0;
-char	  host[MAXHOSTNAMELEN];
+char	  host[SMTPD_MAXHOSTNAMELEN];
 char	 *user = NULL;
 time_t	  timestamp;
 
@@ -125,15 +125,6 @@ struct {
 	size_t		wpos;
 	char		buf[SMTP_LINELEN];
 } pstate;
-
-static void
-sighdlr(int sig)
-{
-	if (sig == SIGALRM) {
-		write(STDERR_FILENO, TIMEOUTMSG, sizeof(TIMEOUTMSG));
-		_exit(2);
-	}
-}
 
 static void
 qp_encoded_write(FILE *fp, char *buf, size_t len)
@@ -174,9 +165,14 @@ enqueue(int argc, char *argv[])
 	char			*line;
 	int			 dotted;
 	int			 inheaders = 0;
+	int			 save_argc;
+	char			**save_argv;
 
 	bzero(&msg, sizeof(msg));
 	time(&timestamp);
+
+	save_argc = argc;
+	save_argv = argv;
 
 	while ((ch = getopt(argc, argv,
 	    "A:B:b:E::e:F:f:iJ::L:mN:o:p:qR:tvx")) != -1) {
@@ -219,8 +215,8 @@ enqueue(int argc, char *argv[])
 	argc -= optind;
 	argv += optind;
 
-	if (gethostname(host, sizeof(host)) == -1)
-		err(1, "gethostname");
+	if (getmailname(host, sizeof(host)) == -1)
+		err(1, "getmailname");
 	if ((pw = getpwuid(getuid())) == NULL)
 		user = "anonymous";
 	if (pw != NULL)
@@ -234,9 +230,6 @@ enqueue(int argc, char *argv[])
 		argc--;
 	}
 
-	signal(SIGALRM, sighdlr);
-	alarm(300);
-
 	fp = tmpfile();
 	if (fp == NULL)
 		err(1, "tmpfile");
@@ -247,6 +240,12 @@ enqueue(int argc, char *argv[])
 
 	/* init session */
 	rewind(fp);
+
+	/* try to connect */
+	/* If the server is not running, enqueue the message offline */
+
+	if (!srv_connect())
+		return (enqueue_offline(save_argc, save_argv, fp));
 
 	if ((msg.fd = open_connection()) == -1)
 		errx(1, "server too busy");
@@ -266,11 +265,11 @@ enqueue(int argc, char *argv[])
 	send_line(fout, verbose, "EHLO localhost\n");
 	get_responses(fout, 1);
 
-	send_line(fout, verbose, "MAIL FROM: <%s>\n", msg.from);
+	send_line(fout, verbose, "MAIL FROM:<%s>\n", msg.from);
 	get_responses(fout, 1);
 
 	for (i = 0; i < msg.rcpt_cnt; i++) {
-		send_line(fout, verbose, "RCPT TO: <%s>\n", msg.rcpts[i]);
+		send_line(fout, verbose, "RCPT TO:<%s>\n", msg.rcpts[i]);
 		get_responses(fout, 1);
 	}
 
@@ -694,7 +693,7 @@ open_connection(void)
 	int		fd;
 	int		n;
 
-	imsg_compose(ibuf, IMSG_SMTP_ENQUEUE_FD, 0, 0, -1, NULL, 0);
+	imsg_compose(ibuf, IMSG_SMTP_ENQUEUE_FD, IMSG_VERSION, 0, -1, NULL, 0);
 
 	while (ibuf->w.queued)
 		if (msgbuf_write(&ibuf->w) < 0)
@@ -729,10 +728,10 @@ open_connection(void)
 	return fd;
 }
 
-int
-enqueue_offline(int argc, char *argv[])
+static int
+enqueue_offline(int argc, char *argv[], FILE *ifile)
 {
-	char	 path[MAXPATHLEN];
+	char	 path[SMTPD_MAXPATHLEN];
 	FILE	*fp;
 	int	 i, fd, ch;
 	mode_t	 omode;
@@ -753,6 +752,11 @@ enqueue_offline(int argc, char *argv[])
 	}
 	umask(omode);
 
+	if (fchmod(fd, 0600) == -1) {
+		unlink(path);
+		exit(1);
+	}
+
 	for (i = 1; i < argc; i++) {
 		if (strchr(argv[i], '|') != NULL) {
 			warnx("%s contains illegal character", argv[i]);
@@ -764,14 +768,14 @@ enqueue_offline(int argc, char *argv[])
 
 	fprintf(fp, "\n");
 
-	while ((ch = fgetc(stdin)) != EOF)
+	while ((ch = fgetc(ifile)) != EOF)
 		if (fputc(ch, fp) == EOF) {
 			warn("write error");
 			unlink(path);
 			exit(1);
 		}
 
-	if (ferror(stdin)) {
+	if (ferror(ifile)) {
 		warn("read error");
 		unlink(path);
 		exit(1);

@@ -1,4 +1,4 @@
-/*	$OpenBSD: smtp.c,v 1.123 2013/01/26 09:37:23 gilles Exp $	*/
+/*	$OpenBSD$	*/
 
 /*
  * Copyright (c) 2008 Gilles Chehade <gilles@poolp.org>
@@ -21,7 +21,6 @@
 #include <sys/types.h>
 #include <sys/queue.h>
 #include <sys/tree.h>
-#include <sys/param.h>
 #include <sys/socket.h>
 
 #include <err.h>
@@ -67,6 +66,7 @@ smtp_imsg(struct mproc *p, struct imsg *imsg)
 		switch (imsg->hdr.type) {
 		case IMSG_DNS_PTR:
 		case IMSG_LKA_EXPAND_RCPT:
+		case IMSG_LKA_HELO:
 		case IMSG_LKA_AUTHENTICATE:
 		case IMSG_LKA_SSL_INIT:
 		case IMSG_LKA_SSL_VERIFY:
@@ -241,7 +241,7 @@ smtp(void)
 	case -1:
 		fatal("smtp: cannot fork");
 	case 0:
-		env->sc_pid = getpid();
+		post_fork(PROC_SMTP);
 		break;
 	default:
 		return (pid);
@@ -249,9 +249,10 @@ smtp(void)
 
 	purge_config(PURGE_EVERYTHING);
 
-	pw = env->sc_pw;
+	if ((pw = getpwnam(SMTPD_USER)) == NULL)
+		fatalx("unknown user " SMTPD_USER);
 
-	if (chroot(pw->pw_dir) == -1)
+	if (chroot(PATH_CHROOT) == -1)
 		fatal("smtp: chroot");
 	if (chdir("/") == -1)
 		fatal("smtp: chdir(\"/\")");
@@ -297,7 +298,7 @@ smtp_setup_events(void)
 
 	TAILQ_FOREACH(l, env->sc_listeners, entry) {
 		log_debug("debug: smtp: listen on %s port %d flags 0x%01x"
-		    " cert \"%s\"", ss_to_text(&l->ss), ntohs(l->port),
+		    " pki \"%s\"", ss_to_text(&l->ss), ntohs(l->port),
 		    l->flags, l->ssl_cert_name);
 
 		session_socket_blockmode(l->fd, BM_NONBLOCK);
@@ -354,7 +355,7 @@ static int
 smtp_enqueue(uid_t *euid)
 {
 	static struct listener	 local, *listener = NULL;
-	char			 buf[MAXHOSTNAMELEN], *hostname;
+	char			 buf[SMTPD_MAXHOSTNAMELEN], *hostname;
 	int			 fd[2];
 
 	if (listener == NULL) {
@@ -418,7 +419,8 @@ smtp_accept(int fd, short event, void *p)
 			log_warn("warn: Disabling incoming SMTP connections");
 			goto pause;
 		}
-		if (errno == EINTR || errno == ECONNABORTED)
+		if (errno == EINTR || errno == EWOULDBLOCK ||
+		    errno == ECONNABORTED)
 			return;
 		fatal("smtp_accept");
 	}
@@ -428,6 +430,7 @@ smtp_accept(int fd, short event, void *p)
 		close(sock);
 		return;
 	}
+	io_set_blocking(sock, 0);
 
 	sessions++;
 	stat_increment("smtp.session", 1);
