@@ -217,7 +217,7 @@ config_load(const char *path)
 		}
 
 		key = buf;
-		while (isspace((int)*key))
+		while (isspace((unsigned char)*key))
 			++key;
 		if (*key == '\0' || *key == '#')
 			continue;
@@ -225,8 +225,8 @@ config_load(const char *path)
 		strsep(&value, " \t:");
 		if (value) {
 			while (*value) {
-				if (!isspace(*value) &&
-				    !(*value == ':' && isspace(*(value + 1))))
+				if (!isspace((unsigned char)*value) &&
+				    !(*value == ':' && isspace((unsigned char)*(value + 1))))
 					break;
 				++value;
 			}
@@ -315,7 +315,7 @@ config_connect(struct config *conf)
 		{ "query_domain",	1 },
 		{ "query_credentials",	2 },
 		{ "query_netaddr",	1 },
-		{ "query_userinfo",	4 },
+		{ "query_userinfo",	3 },
 		{ "query_source",	1 },
 		{ "query_mailaddr",	1 },
 		{ "query_addrname",	1 },
@@ -382,10 +382,10 @@ config_free(struct config *conf)
 
 	config_reset(conf);
 
-	while(dict_poproot(&conf->conf, NULL, &value))
+	while (dict_poproot(&conf->conf, &value))
 		free(value);
 
-	while(dict_poproot(&conf->sources, NULL, NULL))
+	while (dict_poproot(&conf->sources, NULL))
 		;
 
 	free(conf);
@@ -473,6 +473,9 @@ table_mysql_check(int service, const char *key)
 	MYSQL_STMT	*stmt;
 	int		 r, s;
 
+	if (config->db == NULL && config_connect(config) == 0)
+		return (-1);
+
 	stmt = table_mysql_query(key, service);
 	if (stmt == NULL)
 		return (-1);
@@ -500,6 +503,9 @@ table_mysql_lookup(int service, const char *key, char *dst, size_t sz)
 {
 	MYSQL_STMT	*stmt;
 	int		 r, s;
+
+	if (config->db == NULL && config_connect(config) == 0)
+		return (-1);
 
 	stmt = table_mysql_query(key, service);
 	if (stmt == NULL)
@@ -551,11 +557,10 @@ table_mysql_lookup(int service, const char *key, char *dst, size_t sz)
 		}
 		break;
 	case K_USERINFO:
-		if (snprintf(dst, sz, "%s:%s:%s:%s",
+		if (snprintf(dst, sz, "%s:%s:%s",
 		    results_buffer[0],
 		    results_buffer[1],
-		    results_buffer[2],
-		    results_buffer[3]) > (ssize_t)sz) {
+		    results_buffer[2]) > (ssize_t)sz) {
 			log_warnx("warn: table-mysql: result too large");
 			r = -1;
 		}
@@ -571,7 +576,7 @@ table_mysql_lookup(int service, const char *key, char *dst, size_t sz)
 		}
 		break;
 	default:
-		log_warnx("warn: table-mysql: unknown service %i",
+		log_warnx("warn: table-mysql: unknown service %d",
 		    service);
 		r = -1;
 	}
@@ -590,6 +595,9 @@ table_mysql_fetch(int service, char *dst, size_t sz)
 	MYSQL_STMT	*stmt;
 	const char	*k;
 	int		 s;
+
+	if (config->db == NULL && config_connect(config) == 0)
+		return (-1);
 
     retry:
 
@@ -621,7 +629,7 @@ table_mysql_fetch(int service, char *dst, size_t sz)
 	}
 
 	config->source_iter = NULL;
-	while(dict_poproot(&config->sources, NULL, NULL))
+	while (dict_poproot(&config->sources, NULL))
 		;
 
 	while ((s = mysql_stmt_fetch(stmt)) == 0)

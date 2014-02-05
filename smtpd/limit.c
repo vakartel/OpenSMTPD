@@ -56,11 +56,13 @@ limit_mta_set_defaults(struct mta_limits *limits)
 	limits->sessdelay_transaction = 1;
 	limits->sessdelay_keepalive = 10;
 
+	limits->max_failures_per_session = 25;
+
 	limits->family = AF_UNSPEC;
 
-	limits->task_hiwat = 300;
-	limits->task_lowat = 200;
-	limits->task_release = 50;
+	limits->task_hiwat = 50;
+	limits->task_lowat = 30;
+	limits->task_release = 10;
 }
 
 int
@@ -101,6 +103,9 @@ limit_mta_set(struct mta_limits *limits, const char *key, int64_t value)
 		limits->sessdelay_transaction = value;
 	else if (!strcmp(key, "session-keepalive"))
 		limits->sessdelay_keepalive = value;
+
+	else if (!strcmp(key, "max-failures-per-session"))
+		limits->max_failures_per_session = value;
 
 	else if (!strcmp(key, "task-hiwat"))
 		limits->task_hiwat = value;

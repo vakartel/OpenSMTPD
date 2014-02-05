@@ -91,11 +91,12 @@ char		*symget(const char *);
 struct smtpd		*conf = NULL;
 static int		 errors = 0;
 
+struct filter		*filter = NULL;
 struct table		*table = NULL;
 struct rule		*rule = NULL;
 struct listener		 l;
 struct mta_limits	*limits;
-static struct ssl      	*pki_ssl;
+static struct pki	*pki;
 
 static struct listen_opts {
 	char	       *ifx;
@@ -104,7 +105,7 @@ static struct listen_opts {
 	uint16_t	ssl;
 	char	       *pki;
 	uint16_t       	auth;
-	char	        authtable[SMTPD_MAXLINESIZE];
+	struct table   *authtable;
 	char	       *tag;
 	char	       *hostname;
 	struct table   *hostnametable;
@@ -123,6 +124,10 @@ void		 set_localaddrs(void);
 int		 delaytonum(char *);
 int		 is_if_in_group(const char *, const char *);
 
+static struct filter	*create_filter(const char *, const char *);
+static struct filter	*create_filter_chain(const char *);
+static int		 extend_filter_chain(struct filter *, const char *);
+
 typedef struct {
 	union {
 		int64_t		 number;
@@ -136,11 +141,11 @@ typedef struct {
 
 %}
 
-%token	AS QUEUE COMPRESSION ENCRYPTION MAXMESSAGESIZE MAXMTADEFERRED MAXSCHEDULERINFLIGHT LISTEN ON ANY PORT EXPIRE
+%token	AS QUEUE COMPRESSION ENCRYPTION MAXMESSAGESIZE MAXMTADEFERRED LISTEN ON ANY PORT EXPIRE
 %token	TABLE SECURE SMTPS CERTIFICATE DOMAIN BOUNCEWARN LIMIT INET4 INET6
 %token  RELAY BACKUP VIA DELIVER TO LMTP MAILDIR MBOX HOSTNAME HOSTNAMES
-%token	ACCEPT REJECT INCLUDE ERROR MDA FROM FOR SOURCE MTA PKI
-%token	ARROW AUTH TLS LOCAL VIRTUAL TAG TAGGED ALIAS FILTER KEY CA DHPARAMS
+%token	ACCEPT REJECT INCLUDE ERROR MDA FROM FOR SOURCE MTA PKI SCHEDULER
+%token	ARROW AUTH TLS LOCAL VIRTUAL TAG TAGGED ALIAS FILTER FILTERCHAIN KEY CA DHPARAMS
 %token	AUTH_OPTIONAL TLS_REQUIRE USERBASE SENDER MASK_SOURCE VERIFY FORWARDONLY RECIPIENT
 %token	<v.string>	STRING
 %token  <v.number>	NUMBER
@@ -251,15 +256,24 @@ bouncedelays	: bouncedelays ',' bouncedelay
 		| /* EMPTY */
 		;
 
-opt_limit	: INET4 {
-			limits->family = AF_INET;
-		}
-		| INET6 {
-			limits->family = AF_INET6;
-		}
-		| STRING NUMBER {
-			if (!limit_mta_set(limits, $1, $2)) {
-				yyerror("invalid limit keyword");
+opt_limit_mda	: STRING NUMBER {
+			if (!strcmp($1, "max-session")) {
+				conf->sc_mda_max_session = $2;
+			}
+			else if (!strcmp($1, "max-session-per-user")) {
+				conf->sc_mda_max_user_session = $2;
+			}
+			else if (!strcmp($1, "task-lowat")) {
+				conf->sc_mda_task_lowat = $2;
+			}
+			else if (!strcmp($1, "task-hiwat")) {
+				conf->sc_mda_task_hiwat = $2;
+			}
+			else if (!strcmp($1, "task-release")) {
+				conf->sc_mda_task_release = $2;
+			}
+			else {
+				yyerror("invalid scheduler limit keyword: %s", $1);
 				free($1);
 				YYERROR;
 			}
@@ -267,21 +281,67 @@ opt_limit	: INET4 {
 		}
 		;
 
-limits		: opt_limit limits
+limits_mda	: opt_limit_mda limits_mda
+		| /* empty */
+		;
+
+opt_limit_mta	: INET4 {
+			limits->family = AF_INET;
+		}
+		| INET6 {
+			limits->family = AF_INET6;
+		}
+		| STRING NUMBER {
+			if (!limit_mta_set(limits, $1, $2)) {
+				yyerror("invalid mta limit keyword: %s", $1);
+				free($1);
+				YYERROR;
+			}
+			free($1);
+		}
+		;
+
+limits_mta	: opt_limit_mta limits_mta
+		| /* empty */
+		;
+
+opt_limit_scheduler : STRING NUMBER {
+			if (!strcmp($1, "max-inflight")) {
+				conf->sc_scheduler_max_inflight = $2;
+			}
+			else if (!strcmp($1, "max-evp-batch-size")) {
+				conf->sc_scheduler_max_evp_batch_size = $2;
+			}
+			else if (!strcmp($1, "max-msg-batch-size")) {
+				conf->sc_scheduler_max_msg_batch_size = $2;
+			}
+			else if (!strcmp($1, "max-schedule")) {
+				conf->sc_scheduler_max_schedule = $2;
+			}
+			else {
+				yyerror("invalid scheduler limit keyword: %s", $1);
+				free($1);
+				YYERROR;
+			}
+			free($1);
+		}
+		;
+
+limits_scheduler: opt_limit_scheduler limits_scheduler
 		| /* empty */
 		;
 
 opt_pki		: CERTIFICATE STRING {
-			pki_ssl->ssl_cert_file = $2;
+			pki->pki_cert_file = $2;
 		}
 		| KEY STRING {
-			pki_ssl->ssl_key_file = $2;
+			pki->pki_key_file = $2;
 		}
 		| CA STRING {
-			pki_ssl->ssl_ca_file = $2;
+			pki->pki_ca_file = $2;
 		}
 		| DHPARAMS STRING {
-			pki_ssl->ssl_dhparams_file = $2;
+			pki->pki_dhparams_file = $2;
 		}
 		;
 
@@ -320,11 +380,11 @@ opt_listen     	: INET4			{ listen_opts.family = AF_INET; }
 		| AUTH				{ listen_opts.auth = F_AUTH|F_AUTH_REQUIRE; }
 		| AUTH_OPTIONAL			{ listen_opts.auth = F_AUTH; }
 		| AUTH tables  			{
-			strlcpy(listen_opts.authtable, ($2)->t_name, sizeof listen_opts.authtable);
+			listen_opts.authtable = $2;
 			listen_opts.auth = F_AUTH|F_AUTH_REQUIRE;
 		}
 		| AUTH_OPTIONAL tables 		{
-			strlcpy(listen_opts.authtable, ($2)->t_name, sizeof listen_opts.authtable);
+			listen_opts.authtable = $2;
 			listen_opts.auth = F_AUTH;
 		}
 		| TAG STRING			{
@@ -387,6 +447,11 @@ opt_relay_common: AS STRING	{
 			strlcpy(rule->r_value.relayhost.sourcetable, t->t_name,
 			    sizeof rule->r_value.relayhost.sourcetable);
 		}
+		| HOSTNAME STRING {
+			strlcat(rule->r_value.relayhost.heloname, $2,
+			    sizeof rule->r_value.relayhost.heloname);
+			free($2);
+		}
 		| HOSTNAMES tables		{
 			struct table	*t = $2;
 			if (! table_check_use(t, T_DYNAMIC|T_HASH, K_ADDRNAME)) {
@@ -398,10 +463,18 @@ opt_relay_common: AS STRING	{
 			    sizeof rule->r_value.relayhost.helotable);
 		}
 		| PKI STRING {
-			if (strlcpy(rule->r_value.relayhost.cert, $2,
-				sizeof(rule->r_value.relayhost.cert))
-			    >= sizeof(rule->r_value.relayhost.cert))
-				fatal("certificate path too long");
+			if (! lowercase(rule->r_value.relayhost.pki_name, $2,
+				sizeof(rule->r_value.relayhost.pki_name))) {
+				yyerror("pki name too long: %s", $2);
+				free($2);
+				YYERROR;
+			}
+			if (dict_get(conf->sc_pki_dict,
+			    rule->r_value.relayhost.pki_name) == NULL) {
+				log_warnx("pki name not found: %s", $2);
+				free($2);
+				YYERROR;
+			}
 			free($2);
 		}
 		;
@@ -456,7 +529,7 @@ relay_via	: opt_relay_common relay_via
 		;
 
 main		: BOUNCEWARN {
-			bzero(conf->sc_bounce_warn, sizeof conf->sc_bounce_warn);
+			memset(conf->sc_bounce_warn, 0, sizeof conf->sc_bounce_warn);
 		} bouncedelays
 		| QUEUE COMPRESSION {
 			conf->sc_queue_flags |= QUEUE_COMPRESSION;
@@ -470,7 +543,7 @@ main		: BOUNCEWARN {
 				YYERROR;
 			}
 			conf->sc_queue_key = strdup(password);
-			bzero(password, strlen(password));
+			memset(password, 0, strlen(password));
 			if (conf->sc_queue_key == NULL) {
 				yyerror("memory exhausted");
 				YYERROR;
@@ -515,10 +588,8 @@ main		: BOUNCEWARN {
 		}
 		| MAXMTADEFERRED NUMBER  {
 			conf->sc_mta_max_deferred = $2;
-		} 
-		| MAXSCHEDULERINFLIGHT NUMBER  {
-			conf->sc_scheduler_max_inflight = $2;
-		} 
+		}
+		| LIMIT MDA limits_mda
 		| LIMIT MTA FOR DOMAIN STRING {
 			struct mta_limits	*d;
 
@@ -530,83 +601,44 @@ main		: BOUNCEWARN {
 				memmove(limits, d, sizeof(*limits));
 			}
 			free($5);
-		} limits
+		} limits_mta
 		| LIMIT MTA {
 			limits = dict_get(conf->sc_limits_dict, "default");
-		} limits
+		} limits_mta
+		| LIMIT SCHEDULER limits_scheduler
 		| LISTEN {
-			bzero(&l, sizeof l);
-			bzero(&listen_opts, sizeof listen_opts);
+			memset(&l, 0, sizeof l);
+			memset(&listen_opts, 0, sizeof listen_opts);
 			listen_opts.family = AF_UNSPEC;
 		} ON STRING listen {
 			listen_opts.ifx = $4;
 			create_listener(conf->sc_listeners, &listen_opts);
 		}
-		| FILTER STRING			{
-			struct filter *filter;
-			struct filter *tmp;
-
-			filter = xcalloc(1, sizeof *filter, "parse condition: FILTER");
-			if (strlcpy(filter->name, $2, sizeof (filter->name))
-			    >= sizeof (filter->name)) {
-       				yyerror("Filter name too long: %s", filter->name);
-				free($2);
-				free(filter);
-				YYERROR;
-				
-			}
-			(void)snprintf(filter->path, sizeof filter->path,
-			    PATH_FILTERS "/%s", filter->name);
-
-			tmp = dict_get(&conf->sc_filters, filter->name);
-			if (tmp == NULL)
-				dict_set(&conf->sc_filters, filter->name, filter);
-			else {
-       				yyerror("ambiguous filter name: %s", filter->name);
-				free($2);
-				free(filter);
-				YYERROR;
-			}
-			free($2);
-		}
-		| FILTER STRING STRING		{
-			struct filter *filter;
-			struct filter *tmp;
-
-			filter = calloc(1, sizeof (*filter));
-			if (filter == NULL ||
-			    strlcpy(filter->name, $2, sizeof (filter->name))
-			    >= sizeof (filter->name) ||
-			    strlcpy(filter->path, $3, sizeof (filter->path))
-			    >= sizeof (filter->path)) {
-				free(filter);
+		| FILTER STRING STRING {
+			if (!create_filter($2, $3)) {
 				free($2);
 				free($3);
-				free(filter);
-				YYERROR;
-			}
-
-			tmp = dict_get(&conf->sc_filters, filter->name);
-			if (tmp == NULL)
-				dict_set(&conf->sc_filters, filter->name, filter);
-			else {
-       				yyerror("ambiguous filter name: %s", filter->name);
-				free($2);
-				free($3);
-				free(filter);
 				YYERROR;
 			}
 			free($2);
 			free($3);
 		}
-		| PKI STRING	{
-			pki_ssl = dict_get(conf->sc_ssl_dict, $2);
-			if (pki_ssl == NULL) {
-				pki_ssl = xcalloc(1, sizeof *pki_ssl, "parse:pki");
-				xlowercase(pki_ssl->ssl_name, $2, sizeof pki_ssl->ssl_name);
-				dict_set(conf->sc_ssl_dict, pki_ssl->ssl_name, pki_ssl);
+		| FILTERCHAIN STRING {
+			if ((filter = create_filter_chain($2)) == NULL) {
+				free($2);
+				YYERROR;
 			}
+		} filter_list
+		| PKI STRING	{
+			char buf[MAXHOSTNAMELEN];
+			xlowercase(buf, $2, sizeof(buf));
 			free($2);
+			pki = dict_get(conf->sc_pki_dict, buf);
+			if (pki == NULL) {
+				pki = xcalloc(1, sizeof *pki, "parse:pki");
+				strlcpy(pki->pki_name, buf, sizeof(pki->pki_name));
+				dict_set(conf->sc_pki_dict, pki->pki_name, pki);
+			}
 		} pki
 		;
 
@@ -678,6 +710,15 @@ stringel	: STRING			{
 
 string_list	: stringel
 		| stringel comma string_list
+		;
+
+filter_list	:
+		| STRING {
+			if (!extend_filter_chain(filter, $1)) {
+				free($1);
+				YYERROR;
+			}
+		} filter_list
 		;
 
 tableval_list	: string_list			{ }
@@ -1092,11 +1133,12 @@ lookup(char *s)
 		{ "certificate",	CERTIFICATE },
 		{ "compression",	COMPRESSION },
 		{ "deliver",		DELIVER },
-		{ "dh-params",		DHPARAMS },
+		{ "dhparams",		DHPARAMS },
 		{ "domain",		DOMAIN },
 		{ "encryption",		ENCRYPTION },
 		{ "expire",		EXPIRE },
 		{ "filter",		FILTER },
+		{ "filterchain",	FILTERCHAIN },
 		{ "for",		FOR },
 		{ "forward-only",      	FORWARDONLY },
 		{ "from",		FROM },
@@ -1114,7 +1156,6 @@ lookup(char *s)
 		{ "mask-source",	MASK_SOURCE },
 		{ "max-message-size",  	MAXMESSAGESIZE },
 		{ "max-mta-deferred",  	MAXMTADEFERRED },
-		{ "max-scheduler-inflight",  	MAXSCHEDULERINFLIGHT },
 		{ "mbox",		MBOX },
 		{ "mda",		MDA },
 		{ "mta",		MTA },
@@ -1125,6 +1166,7 @@ lookup(char *s)
 		{ "recipient",		RECIPIENT },
 		{ "reject",		REJECT },
 		{ "relay",		RELAY },
+		{ "scheduler",		SCHEDULER },
 		{ "secure",		SECURE },
 		{ "sender",    		SENDER },
 		{ "smtps",		SMTPS },
@@ -1153,9 +1195,9 @@ lookup(char *s)
 
 #define MAXPUSHBACK	128
 
-char	*parsebuf;
+u_char	*parsebuf;
 int	 parseindex;
-char	 pushback_buffer[MAXPUSHBACK];
+u_char	 pushback_buffer[MAXPUSHBACK];
 int	 pushback_index = 0;
 
 int
@@ -1246,8 +1288,8 @@ findeol(void)
 int
 yylex(void)
 {
-	char	 buf[8096];
-	char	*p, *val;
+	u_char	 buf[8096];
+	u_char	*p, *val;
 	int	 quotec, next, c;
 	int	 token;
 
@@ -1270,7 +1312,7 @@ top:
 				return (findeol());
 			}
 			if (isalnum(c) || c == '_') {
-				*p++ = (char)c;
+				*p++ = c;
 				continue;
 			}
 			*p = '\0';
@@ -1315,7 +1357,7 @@ top:
 				yyerror("string too long");
 				return (findeol());
 			}
-			*p++ = (char)c;
+			*p++ = c;
 		}
 		yylval.v.string = strdup(buf);
 		if (yylval.v.string == NULL)
@@ -1409,7 +1451,7 @@ check_file_secrecy(int fd, const char *fname)
 		log_warnx("warn: %s: owner not root or current user", fname);
 		return (-1);
 	}
-	if (st.st_mode & (S_IRWXG | S_IRWXO)) {
+	if (st.st_mode & (S_IWGRP | S_IXGRP | S_IRWXO)) {
 		log_warnx("warn: %s: group/world readable/writeable", fname);
 		return (-1);
 	}
@@ -1475,7 +1517,7 @@ parse_config(struct smtpd *x_conf, const char *filename, int opts)
 		return (-1);
 
 	conf = x_conf;
-	bzero(conf, sizeof(*conf));
+	memset(conf, 0, sizeof(*conf));
 
 	strlcpy(conf->sc_hostname, hostname, sizeof(conf->sc_hostname));
 
@@ -1484,6 +1526,7 @@ parse_config(struct smtpd *x_conf, const char *filename, int opts)
 	conf->sc_tables_dict = calloc(1, sizeof(*conf->sc_tables_dict));
 	conf->sc_rules = calloc(1, sizeof(*conf->sc_rules));
 	conf->sc_listeners = calloc(1, sizeof(*conf->sc_listeners));
+	conf->sc_pki_dict = calloc(1, sizeof(*conf->sc_pki_dict));
 	conf->sc_ssl_dict = calloc(1, sizeof(*conf->sc_ssl_dict));
 	conf->sc_limits_dict = calloc(1, sizeof(*conf->sc_limits_dict));
 
@@ -1493,12 +1536,13 @@ parse_config(struct smtpd *x_conf, const char *filename, int opts)
 	if (conf->sc_tables_dict == NULL	||
 	    conf->sc_rules == NULL		||
 	    conf->sc_listeners == NULL		||
-	    conf->sc_ssl_dict == NULL		||
+	    conf->sc_pki_dict == NULL		||
 	    conf->sc_limits_dict == NULL) {
 		log_warn("warn: cannot allocate memory");
 		free(conf->sc_tables_dict);
 		free(conf->sc_rules);
 		free(conf->sc_listeners);
+		free(conf->sc_pki_dict);
 		free(conf->sc_ssl_dict);
 		free(conf->sc_limits_dict);
 		return (-1);
@@ -1511,6 +1555,7 @@ parse_config(struct smtpd *x_conf, const char *filename, int opts)
 
 	dict_init(&conf->sc_filters);
 
+	dict_init(conf->sc_pki_dict);
 	dict_init(conf->sc_ssl_dict);
 	dict_init(conf->sc_tables_dict);
 
@@ -1527,6 +1572,15 @@ parse_config(struct smtpd *x_conf, const char *filename, int opts)
 
 	conf->sc_mta_max_deferred = 100;
 	conf->sc_scheduler_max_inflight = 5000;
+	conf->sc_scheduler_max_schedule = 10;
+	conf->sc_scheduler_max_evp_batch_size = 256;
+	conf->sc_scheduler_max_msg_batch_size = 1024;
+
+	conf->sc_mda_max_session = 50;
+	conf->sc_mda_max_user_session = 7;
+	conf->sc_mda_task_hiwat = 50;
+	conf->sc_mda_task_lowat = 30;
+	conf->sc_mda_task_release = 10;
 
 	if ((file = pushfile(filename, 0)) == NULL) {
 		purge_config(PURGE_EVERYTHING);
@@ -1681,11 +1735,7 @@ create_listener(struct listenerlist *ll,  struct listen_opts *lo)
 	if (lo->pki && !lo->ssl)
 		errx(1, "invalid listen option: pki requires tls/smtps");
 	
-	if (lo->ssl && !lo->pki)
-		errx(1, "invalid listen option: tls/smtps requires pki");
-
 	flags = lo->flags;
-
 
 	if (lo->port) {
 		lo->flags = lo->ssl|lo->auth|flags;
@@ -1725,19 +1775,29 @@ config_listener(struct listener *h,  struct listen_opts *lo)
 	if (lo->hostname == NULL)
 		lo->hostname = conf->sc_hostname;
 
-	h->ssl = NULL;
-	h->ssl_cert_name[0] = '\0';
+	h->pki_name[0] = '\0';
 
 	if (lo->authtable != NULL)
-		(void)strlcpy(h->authtable, lo->authtable, sizeof(h->authtable));
-	if (lo->pki != NULL)
-		(void)strlcpy(h->ssl_cert_name, lo->pki, sizeof(h->ssl_cert_name));
+		(void)strlcpy(h->authtable, lo->authtable->t_name, sizeof(h->authtable));
+	if (lo->pki != NULL) {
+		if (! lowercase(h->pki_name, lo->pki, sizeof(h->pki_name))) {
+			log_warnx("pki name too long: %s", lo->pki);
+			fatalx(NULL);
+		}
+		if (dict_get(conf->sc_pki_dict, h->pki_name) == NULL) {
+			log_warnx("pki name not found: %s", lo->pki);
+			fatalx(NULL);
+		}
+	}
 	if (lo->tag != NULL)
 		(void)strlcpy(h->tag, lo->tag, sizeof(h->tag));
 
 	(void)strlcpy(h->hostname, lo->hostname, sizeof(h->hostname));
 	if (lo->hostnametable)
 		(void)strlcpy(h->hostnametable, lo->hostnametable->t_name, sizeof(h->hostnametable));
+
+	if (lo->ssl & F_TLS_VERIFY)
+		h->flags |= F_TLS_VERIFY;
 }
 
 struct listener *
@@ -1747,7 +1807,7 @@ host_v4(const char *s, in_port_t port)
 	struct sockaddr_in	*sain;
 	struct listener		*h;
 
-	bzero(&ina, sizeof(ina));
+	memset(&ina, 0, sizeof(ina));
 	if (inet_pton(AF_INET, s, &ina) != 1)
 		return (NULL);
 
@@ -1768,7 +1828,7 @@ host_v6(const char *s, in_port_t port)
 	struct sockaddr_in6	*sin6;
 	struct listener		*h;
 
-	bzero(&ina6, sizeof(ina6));
+	memset(&ina6, 0, sizeof(ina6));
 	if (inet_pton(AF_INET6, s, &ina6) != 1)
 		return (NULL);
 
@@ -1791,9 +1851,9 @@ host_dns(struct listenerlist *al, struct listen_opts *lo)
 	struct sockaddr_in6	*sin6;
 	struct listener		*h;
 
-	bzero(&hints, sizeof(hints));
+	memset(&hints, 0, sizeof(hints));
 	hints.ai_family = PF_UNSPEC;
-	hints.ai_socktype = SOCK_DGRAM; /* DUMMY */
+	hints.ai_socktype = SOCK_STREAM;
 	error = getaddrinfo(lo->ifx, NULL, &hints, &res0);
 	if (error == EAI_AGAIN || error == EAI_NODATA || error == EAI_NONAME)
 		return (0);
@@ -2036,4 +2096,70 @@ is_if_in_group(const char *ifname, const char *groupname)
 end:
 	close(s);
 	return ret;
+}
+
+struct filter *
+create_filter(const char *name, const char *path)
+{
+	struct filter	*f;
+
+	if (dict_get(&conf->sc_filters, name)) {
+		yyerror("filter \"%s\" already defined", name);
+		return (NULL);
+	}
+
+	f = xcalloc(1, sizeof(*f), "create_filter");
+	strlcpy(f->name, name, sizeof(f->name));
+	strlcpy(f->path, path, sizeof(f->path));
+
+	dict_xset(&conf->sc_filters, name, f);
+
+	return (f);
+}
+
+static struct filter *
+create_filter_chain(const char *name)
+{
+	struct filter	*f;
+
+	if (dict_get(&conf->sc_filters, name)) {
+		yyerror("filter \"%s\" already defined", name);
+		return (NULL);
+	}
+	f = xcalloc(1, sizeof(*f), "create_filter_chain");
+	strlcpy(f->name, name, sizeof(f->name));
+	f->chain = 1;
+
+	dict_xset(&conf->sc_filters, name, f);
+
+	return (f);
+}
+
+static int
+extend_filter_chain(struct filter *f, const char *name)
+{
+	int	i;
+
+	if (!f->chain) {
+		yyerror("filter \"%s\" is not a chain", f->name);
+		return (0);
+	}
+
+	if (dict_get(&conf->sc_filters, name) == NULL) {
+		yyerror("undefined filter \"%s\"", name);
+		return (0);
+	}
+	if (dict_get(&conf->sc_filters, name) == f) {
+		yyerror("filter chain cannot contain itself");
+		return (0);
+	}
+
+	for (i = 0; i < MAX_FILTER_PER_CHAIN; i++) {
+		if (f->filters[i][0] == '\0') {
+			strlcpy(f->filters[i], name, sizeof(f->filters[i]));
+			return (1);
+		}
+	}
+	yyerror("filter chain \"%s\" is full", f->name);
+	return (0);
 }

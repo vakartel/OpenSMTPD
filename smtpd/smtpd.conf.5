@@ -1,4 +1,4 @@
-.\"	$OpenBSD: smtpd.conf.5,v 1.105 2013/08/08 07:08:34 jmc Exp $
+.\"	$OpenBSD: smtpd.conf.5,v 1.112 2013/12/05 10:27:30 jmc Exp $
 .\"
 .\" Copyright (c) 2008 Janne Johansson <jj@openbsd.org>
 .\" Copyright (c) 2009 Jacek Masiulaniec <jacekm@dobremiasto.net>
@@ -17,7 +17,7 @@
 .\" OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 .\"
 .\"
-.Dd $Mdocdate: August 8 2013 $
+.Dd $Mdocdate: December 5 2013 $
 .Dt SMTPD.CONF 5
 .Os
 .Sh NAME
@@ -79,8 +79,7 @@ from first to last.
 The first matching rule decides what action is taken.
 If no rule matches the message,
 the default action is to reject the message.
-.Pp
-Whenever \! is used, it will performe a reverse match.
+An exclamation mark may be specified to perform a reverse match.
 .Pp
 Following the accept/reject
 decision comes the optional tag matching:
@@ -90,11 +89,11 @@ decision comes the optional tag matching:
 .Op Ic \!
 .Ic tag
 .Xc
-If specified, the rule will only be matched if the client session was tagged
+If specified, the rule will only be matched if the client session was tagged with
 .Ar tag .
 .El
 .Pp
-Then, comes the client's IP address filter:
+After that the client's IP address filter is specified:
 .Bl -tag -width Ds
 .It Ic from any
 Make the rule match regardless of the IP of connecting client.
@@ -253,14 +252,15 @@ Further filtering may be achieved on specific recipients if desired:
 .Bl -tag -width Ds
 .It Xo
 .Ic recipient
-.Op Ic \!
-.Ic recipients
+.Op Ic \&!
+.Ar recipients
 .Xc
 If specified, the rule will only be matched if the recipient email address
 is found in the table
 .Ar recipients .
 The table may contain complete email addresses or apply to an entire
-domain if prefixed with @.
+domain if prefixed with
+.Sq @ .
 .El
 .Pp
 If the method of delivery is local, a user database may be
@@ -288,7 +288,7 @@ Mail is added to a maildir.
 Its location,
 .Ar path ,
 may contain format specifiers that are expanded before use
-(see above).
+.Pq see Sx FORMAT SPECIFIERS .
 If
 .Ar path
 is not provided, then
@@ -302,13 +302,16 @@ Mail is piped to the specified
 .Ar program ,
 which is run with the privileges of the user the message is destined to.
 This parameter may use conversion specifiers that are expanded before use
-(see above).
+.Pq see Sx FORMAT SPECIFIERS .
 .It Xo
 .Ic relay
 .Op Ic backup Op Ar mx
 .Op Ic as Ar address
 .Op Ic source Ar source
+.Bk -words
+.Op Ic hostname Ar name
 .Op Ic hostnames Ar names
+.Ek
 .Op Ic pki Ar pkiname
 .Op Ic tls | verify
 .Xc
@@ -353,18 +356,31 @@ By default, when connecting to a remote server,
 .Xr smtpd 8
 advertises its default server name.
 A
+.Ic hostname
+parameter may be specified to advertise the alternate hostname
+.Ar name .
+If the
+.Ic source
+parameter is used, the
 .Ic hostnames
-parameter may be specified to advertise an alternate hostname.
+parameter may be specified to advertise a hostname based on
+the source address.
 Table
 .Ar names
 contains a mapping of IP addresses to hostnames and
 .Xr smtpd 8
 will automatically select the name that matches its source address
 when connected to the remote server.
+The
+.Ic hostname
+and
+.Ic hostnames
+parameters are mutually exclusive.
 .Pp
 When relaying, STARTTLS is always attempted if available on remote host
 and OpenSMTPD will try to present a certificate matching the outgoing
-hostname if one is registered in the pki. If
+hostname if one is registered in the pki.
+If
 .Ic pki
 is specified, the certificate registered for
 .Ar pkiname
@@ -372,12 +388,12 @@ is used instead.
 .Pp
 If
 .Ic tls
-is specified, OpenSMTPD will refuse to relay unless remote host provides
+is specified, OpenSMTPD will refuse to relay unless the remote host provides
 STARTTLS.
 .Pp
 If
 .Ic verify
-is specified, OpenSMTPD will refuse to relay unless remote host provides
+is specified, OpenSMTPD will refuse to relay unless the remote host provides
 STARTTLS and the certificate it presented has been verified.
 .Pp
 Note that the
@@ -392,8 +408,10 @@ as they will prevent proper relaying on the Internet.
 .Op Ic auth Aq Ar auth
 .Op Ic as Ar address
 .Op Ic source Ar source
+.Op Ic hostname Ar name
 .Op Ic hostnames Ar names
 .Op Ic pki Ar pkiname
+.Op Ic verify
 .Xc
 Mail is relayed through the specified
 .Ar host
@@ -421,10 +439,10 @@ In addition, credentials for authenticated relaying may be provided
 when using a secure schema.
 For example:
 .Bd -literal -offset indent
-tls+auth://label@mx.example.org		 # over TLS
-smtps+auth://label@mx.example.org   	 # over SMTPS
-secure+auth://label@mx.example.org	 # over either \e
-				  	 # SMTPS or TLS
+tls+auth://label@mx.example.org		# over TLS
+smtps+auth://label@mx.example.org	# over SMTPS
+secure+auth://label@mx.example.org	# over either \e
+					# SMTPS or TLS
 .Ed
 .Pp
 If a pki entry exists for the outgoing hostname, or one is provided
@@ -468,22 +486,40 @@ By default, when connecting to a remote server,
 .Xr smtpd 8
 advertises its default server name.
 A
+.Ic hostname
+parameter may be specified to advertise the alternate hostname
+.Ar name .
+If the
+.Ic source
+parameter is used, the
 .Ic hostnames
-parameter may be specified to advertise an alternate hostname.
+parameter may be specified to advertise a hostname based on
+the source address.
 Table
 .Ar names
 contains a mapping of IP addresses to hostnames and
 .Xr smtpd 8
 will automatically select the name that matches its source address
 when connected to the remote server.
+The
+.Ic hostname
+and
+.Ic hostnames
+parameters are mutually exclusive.
 .El
+.Pp
+If
+.Ic verify
+is specified, OpenSMTPD will refuse to relay unless the remote host provides
+STARTTLS and the certificate it presented has been verified.
+The relay URL must specify TLS for this option to be valid.
 .Pp
 Additional per-rule adjustments available:
 .Bl -tag -width Ds
-.It Ic expire Ar n Brq Ar s\*(Bam\*(Bah\*(Bad
+.It Ic expire Ar n Brq Ar s|m|h|d
 Specify how long a message that matched this rule can stay in the queue.
 .El
-.It Ic bounce-warn Ar n Bro Ar s\*(Bam\*(Bah\*(Bad Brc Bq , Ar ...
+.It Ic bounce-warn Ar n Bro Ar s|m|h|d Brc Bq , Ar ...
 Specify the delays for which temporary failure reports must be generated
 when messages are stuck in the queue.
 For example:
@@ -494,7 +530,7 @@ bounce-warn	1h, 6h, 2d
 will generate a failure report when an envelope is in the queue for more
 than one hour, six hours and two days.
 The default is 4h.
-.It Ic expire Ar n Brq Ar s\*(Bam\*(Bah\*(Bad
+.It Ic expire Ar n Brq Ar s|m|h|d
 Specify how long a message can stay in the queue.
 The default value is 4 days.
 For example:
@@ -521,18 +557,25 @@ If a
 is specified, the restriction only applies when connecting
 to MXs for this domain.
 .It Xo
+.Ic limit scheduler max-inflight
+.Ar num
+.Xc
+Suspend the scheduling of envelopes for deliver/relay until the number
+of inflight envelopes falls below
+.Ar num .
+Changing the default value might degrade performances.
+.It Xo
 .Bk -words
 .Ic listen on Ar interface
 .Op Ar family
 .Op Ic port Ar port
-.Op Ic tls | tls-require | smtps | secure
+.Op Ic tls | tls-require | tls-require verify | smtps | secure
 .Op Ic pki Ar pkiname
-.Op Ic auth | auth-optional
+.Op Ic auth | auth-optional | auth Ar authtable | Ic auth-optional Ar authtable
 .Op Ic tag Ar tag
 .Op Ic hostname Ar hostname
 .Op Ic hostnames Ar names
 .Op Ic mask-source
-.Op Ic verify
 .Ek
 .Xc
 Specify an
@@ -560,9 +603,14 @@ by default on port 465.
 .Ic tls-require
 may be used to force clients to establish a secure connection
 before being allowed to start an SMTP transaction.
+.Pp
+If
+.Ic tls-require verify
+is specified, the client must provide a valid certificate to be
+able to establish an SMTP session.
+.Pp
 .Ic secure
 may be specified to provide both STARTTLS and SMTPS services.
-
 Host certificates may be used for these connections,
 and must be priorly declared using the pki directive.
 If
@@ -589,6 +637,15 @@ untrusted senders and outgoing mail from authenticated users in
 situations where it is not possible to listen on the submission
 port.
 .Pp
+Both
+.Ic auth
+and
+.Ic auth-optional
+accept a table as parameter.
+When provided, credentials are looked up in this table.
+Credentials format is described in
+.Xr table 5 .
+.Pp
 If the
 .Ic tag
 parameter is used, then clients connecting to the listener will be
@@ -602,24 +659,18 @@ instead of the default server name.
 .Pp
 The
 .Ic hostnames
-parameter allows to override the server name for specific addresses.
+parameter overrides the server name for specific addresses.
 Table
 .Ar names
 contains a mapping of IP addresses to hostnames and
 .Xr smtpd 8
-will use the host name that matches the address on which the connection arrives
+will use the hostname that matches the address on which the connection arrives
 if it is found in the mapping.
 .Pp
 If the
 .Ic mask-source
 parameter is used, then the listener will skip the "from" part
 when prepending the "Received" header.
-.Pp
-If the listener is configured to provide SMTPS or STARTTLS and the
-.Ic verify
-parameter is used, then clients will be required to present a
-certificate than can be verified before a SMTP session can be
-initiated.
 .It Ic max-message-size Ar n
 Specify a maximum message size of
 .Ar n
@@ -628,27 +679,32 @@ The argument may contain a multiplier, as documented in
 .Xr scan_scaled 3 .
 The default maximum message size is 35MB if none is specified.
 .It Ic pki Ar hostname Ic certificate Ar certfile
-Associate certificate located in
+Associate the certificate located in
 .Ar certfile
-to
+with
 .Ar hostname .
 .Pp
-A certificate chain may be created by appending one or many
-certificates, including a Certificate Authority certificate,
+A certificate chain may be created by appending one or many certificates,
+including a Certificate Authority certificate,
 to
 .Ar certfile .
 .Pp
 Creation of certificates is documented in
 .Xr starttls 8 .
 .It Ic pki Ar hostname Ic key Ar keyfile
-Associate key located in
+Associate the key located in
 .Ar keyfile
-to
+with
+.Ar hostname .
+.It Ic pki Ar hostname Ic ca Ar cafile
+Associate a custom CA certificate
+.Ar cafile
+with
 .Ar hostname .
 .It Ic pki Ar hostname Ic dhparams Ar dhfile
-Associate Diffie-Hellman parameters located in
+Associate the Diffie-Hellman parameters located in
 .Ar dhfile
-to
+with
 .Ar hostname .
 .Pp
 The parameters are used for ephemeral key exchange.
@@ -672,7 +728,7 @@ It can be obtained using the
 .Xr openssl 1
 utility as follow:
 .Bd -literal -offset indent
-$ openssl rand -hex 16
+$ openssl rand \-hex 16
 .Ed
 .Pp
 If the
@@ -695,6 +751,10 @@ perform compression before encryption.
 Tables are used to provide additional configuration information for
 .Xr smtpd 8
 in the form of lists or key-value mappings.
+The format of the entries depends on what the table is used for.
+Refer to
+.Xr table 5
+for the exhaustive documentation.
 .Pp
 The table is identified using table name
 .Ar name ;
@@ -746,7 +806,7 @@ many mappings as a list of comma separated
 .Ar key Ns = Ns Ar value
 descriptions.
 .El
-.Pp
+.Ss FORMAT SPECIFIERS
 Some configuration directives support expansion of their parameters at runtime.
 Such directives (for example
 .Ar deliver to maildir ,
@@ -788,6 +848,15 @@ For example, with recipient "User+Tag@Example.org":
 %{rcpt:strip}		expands to "User@Example.org"
 %{rcpt:lowercase|strip}	expands to "user@example.org"
 .Ed
+.Pp
+For security concerns, expanded values are sanitized and potentially
+dangerous characters are replaced with ":".
+In situations where they are desirable, the "raw" modifier may be applied.
+For example, with recipient "user+t?g@example.org":
+.Bd -literal -offset indent
+%{rcpt}		expands to "user+t:g@example.org"
+%{rcpt:raw}	expands to "user+t?g@example.org"
+.Ed
 .Sh FILES
 .Bl -tag -width "/etc/mail/smtpd.confXXX"
 .It Pa /etc/mail/smtpd.conf
@@ -822,7 +891,7 @@ A secrets file is needed to specify a username and password:
 # touch /etc/mail/secrets
 # chmod 640 /etc/mail/secrets
 # chown root:_smtpd /etc/mail/secrets
-# echo "label username:password" \*(Gt /etc/mail/secrets
+# echo "label username:password" > /etc/mail/secrets
 # makemap /etc/mail/secrets
 .Ed
 .Pp
@@ -845,9 +914,9 @@ The mail server listens on all interfaces the default route(s) point to.
 Mail with a local destination should be sent to an external mda.
 First, the RSA certificate is created:
 .Bd -literal -offset indent
-# openssl genrsa -out /etc/ssl/private/mail.example.com.key 4096
-# openssl req -new -x509 -key /etc/ssl/private/mail.example.com.key \e
-	-out /etc/ssl/mail.example.com.crt -days 365
+# openssl genrsa \-out /etc/ssl/private/mail.example.com.key 4096
+# openssl req \-new \-x509 \-key /etc/ssl/private/mail.example.com.key \e
+	\-out /etc/ssl/mail.example.com.crt \-days 365
 # chmod 600 /etc/ssl/mail.example.com.crt
 # chmod 600 /etc/ssl/private/mail.example.com.key
 .Ed
@@ -864,13 +933,14 @@ listen on egress tls pki mail.example.com auth
 
 table aliases db:/etc/mail/aliases.db
 
-accept for local alias <aliases> deliver to mda "/path/to/mda -f -"
+accept for local alias <aliases> deliver to mda "/path/to/mda \-f \-"
 accept from any for domain example.org \e
-	deliver to mda "/path/to/mda -f -"
+	deliver to mda "/path/to/mda \-f \-"
 accept for any relay
 .Ed
 .Sh SEE ALSO
 .Xr mailer.conf 5 ,
+.Xr table 5 ,
 .Xr makemap 8 ,
 .Xr smtpd 8
 .Sh HISTORY

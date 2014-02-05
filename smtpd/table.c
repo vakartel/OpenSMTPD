@@ -146,7 +146,7 @@ table_lookup(struct table *table, const char *key, enum table_service kind,
 		    (lk) ? table_dump_lookup(kind, lk): "found",
 		    lk ? "\"" : "");
 	else
-		log_trace(TRACE_LOOKUP, "lookup: %s \"%s\" as %s in table %s:%s -> %i",
+		log_trace(TRACE_LOOKUP, "lookup: %s \"%s\" as %s in table %s:%s -> %d",
 		    lk ? "lookup" : "check",
 		    lkey,
 		    table_service_name(kind),
@@ -176,7 +176,7 @@ table_fetch(struct table *table, enum table_service kind, union lookup *lk)
 		    (lk) ? table_dump_lookup(kind, lk): "found",
 		    lk ? "\"" : "");
 	else
-		log_trace(TRACE_LOOKUP, "lookup: fetch %s from table %s:%s -> %i",
+		log_trace(TRACE_LOOKUP, "lookup: fetch %s from table %s:%s -> %d",
 		    table_service_name(kind),
 		    table_backend_name(table->t_backend),
 		    table->t_name,
@@ -266,7 +266,7 @@ table_destroy(struct table *t)
 {
 	void	*p = NULL;
 
-	while (dict_poproot(&t->t_dict, NULL, (void **)&p))
+	while (dict_poproot(&t->t_dict, (void **)&p))
 		free(p);
 
 	dict_xpop(env->sc_tables_dict, t->t_name);
@@ -380,7 +380,7 @@ table_mailaddr_match(const char *s1, const char *s2)
 	if (! text_to_mailaddr(&m2, s2))
 		return 0;
 
-	if (strcasecmp(m1.domain, m2.domain))
+	if (! table_domain_match(m1.domain, m2.domain))
 		return 0;
 
 	if (m2.user[0])
@@ -452,7 +452,7 @@ table_inet6_match(struct sockaddr_in6 *ss, struct netaddr *ssmask)
 	struct in6_addr	 mask;
 	int		 i;
 
-	bzero(&mask, sizeof(mask));
+	memset(&mask, 0, sizeof(mask));
 	for (i = 0; i < ssmask->bits / 8; i++)
 		mask.s6_addr[i] = 0xff;
 	i = ssmask->bits % 8;
@@ -570,7 +570,17 @@ table_parse_lookup(enum table_service service, const char *key,
 			return (-1);
 
 		p = strchr(line, ':');
-		if (p == NULL || p == line || p == line + len - 1)
+		if (p == NULL) {
+			if (strlcpy(lk->creds.username, key, sizeof (lk->creds.username))
+			    >= sizeof (lk->creds.username))
+				return (-1);
+			if (strlcpy(lk->creds.password, line, sizeof(lk->creds.password))
+			    >= sizeof(lk->creds.password))
+				return (-1);
+			return (1);
+		}
+
+		if (p == line || p == line + len - 1)
 			return (-1);
 
 		memmove(lk->creds.username, line, p - line);
@@ -642,13 +652,13 @@ table_dump_lookup(enum table_service s, union lookup *lk)
 		break;
 
 	case K_NETADDR:
-		snprintf(buf, sizeof(buf), "%s/%i",
+		snprintf(buf, sizeof(buf), "%s/%d",
 		    sockaddr_to_text((struct sockaddr *)&lk->netaddr.ss),
 		    lk->netaddr.bits);
 		break;
 
 	case K_USERINFO:
-		snprintf(buf, sizeof(buf), "%s:%i:%i:%s",
+		snprintf(buf, sizeof(buf), "%s:%d:%d:%s",
 		    lk->userinfo.username,
 		    lk->userinfo.uid,
 		    lk->userinfo.gid,
@@ -707,6 +717,8 @@ parse_sockaddr(struct sockaddr *sa, int family, const char *str)
 		return (0);
 
 	case PF_INET6:
+		if (strncasecmp("ipv6:", str, 5) == 0)
+			str += 5;
 		cp = strchr(str, SCOPE_DELIMITER);
 		if (cp) {
 			str2 = strdup(str);

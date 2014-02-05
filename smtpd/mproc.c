@@ -170,7 +170,7 @@ mproc_dispatch(int fd, short event, void *arg)
 
 	if (event & EV_WRITE) {
 		n = msgbuf_write2(&p->imsgbuf.w);
-		if (n == -1) {
+		if (n == 0 || (n == -1 && errno != EAGAIN)) {
 			/* this pipe is dead, so remove the event handler */
 			if (smtpd_process != PROC_CONTROL ||
 			    p->proc != PROC_CLIENT)
@@ -178,9 +178,10 @@ mproc_dispatch(int fd, short event, void *arg)
 				    proc_name(smtpd_process),  p->name);
 			p->handler(p, NULL);
 			return;
+		} else if (n != -1) {
+			p->bytes_out += n;
+			p->bytes_queued -= n;
 		}
-		p->bytes_out += n;
-		p->bytes_queued -= n;
 	}
 
 	for (;;) {
@@ -221,8 +222,8 @@ msgbuf_write2(struct msgbuf *msgbuf)
 		char		buf[CMSG_SPACE(sizeof(int))];
 	} cmsgbuf;
 
-	bzero(&iov, sizeof(iov));
-	bzero(&msg, sizeof(msg));
+	memset(&iov, 0, sizeof(iov));
+	memset(&msg, 0, sizeof(msg));
 	TAILQ_FOREACH(buf, &msgbuf->bufs, entry) {
 		if (i >= IOV_MAX)
 			break;
@@ -248,7 +249,7 @@ msgbuf_write2(struct msgbuf *msgbuf)
 
 again:
 	if ((n = sendmsg(msgbuf->fd, &msg, 0)) == -1) {
-		if (errno == EAGAIN || errno == EINTR)
+		if (errno == EINTR)
 			goto again;
 		if (errno == ENOBUFS)
 			errno = EAGAIN;

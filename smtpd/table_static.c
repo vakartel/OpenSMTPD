@@ -103,7 +103,7 @@ table_static_parse(struct table *t, const char *config, enum table_type type)
 		}
 
 		keyp = buf;
-		while (isspace((int)*keyp))
+		while (isspace((unsigned char)*keyp))
 			++keyp;
 		if (*keyp == '\0' || *keyp == '#')
 			continue;
@@ -111,8 +111,8 @@ table_static_parse(struct table *t, const char *config, enum table_type type)
 		strsep(&valp, " \t:");
 		if (valp) {
 			while (*valp) {
-				if (!isspace(*valp) &&
-				    !(*valp == ':' && isspace(*(valp + 1))))
+				if (!isspace((unsigned char)*valp) &&
+				    !(*valp == ':' && isspace((unsigned char)*(valp + 1))))
 					break;
 				++valp;
 			}
@@ -161,7 +161,7 @@ table_static_update(struct table *table)
 		goto err;
 
 	/* replace former table, frees t */
-	while (dict_poproot(&table->t_dict, NULL, (void **)&p))
+	while (dict_poproot(&table->t_dict, (void **)&p))
 		free(p);
 	dict_merge(&table->t_dict, &t->t_dict);
 	table_destroy(t);

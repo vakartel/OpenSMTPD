@@ -74,7 +74,7 @@ inet_socket (char *address)
 	 hostname = address;
 	 s = -1;
 
-	 bzero(&hints, sizeof(hints));
+	 memset(&hints, 0, sizeof(hints));
 	 hints.ai_family = PF_UNSPEC;
 	 hints.ai_socktype = SOCK_STREAM;
 	 hints.ai_flags = AI_NUMERICSERV;
@@ -108,7 +108,7 @@ unix_socket(char *path) {
 	 struct sockaddr_un addr;
 	 int s;
 
-	 bzero(&addr, sizeof(addr));
+	 memset(&addr, 0, sizeof(addr));
 
 	 if ((s = socket(PF_LOCAL, SOCK_STREAM, 0)) == -1) {
 		 warn("socket");
@@ -217,7 +217,7 @@ delivery_lmtp_open(struct deliver *deliver)
 			 break;
 
 		 default:
-			errx(1, "Bogus state %i", state);
+			errx(1, "Bogus state %d", state);
 		 }
 	 }
 

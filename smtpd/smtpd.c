@@ -54,7 +54,7 @@
 
 static void parent_imsg(struct mproc *, struct imsg *);
 static void usage(void);
-static void parent_shutdown(void);
+static void parent_shutdown(int);
 static void parent_send_config(int, short, void *);
 static void parent_send_config_lka(void);
 static void parent_send_config_mfa(void);
@@ -75,7 +75,7 @@ static int	offline_enqueue(char *);
 static void	purge_task(int, short, void *);
 static void	log_imsg(int, int, struct imsg *);
 static int	parent_auth_user(const char *, const char *);
-static void	load_ssl_tree(void);
+static void	load_pki_tree(void);
 
 enum child_type {
 	CHILD_DAEMON,
@@ -136,7 +136,7 @@ int	profiling = 0;
 int	verbose = 0;
 int	debug = 0;
 int	foreground = 0;
-int     control_socket = -1;
+int	control_socket = -1;
 
 struct tree	 children;
 
@@ -281,7 +281,7 @@ parent_imsg(struct mproc *p, struct imsg *imsg)
 			return;
 
 		case IMSG_CTL_SHUTDOWN:
-			parent_shutdown();
+			parent_shutdown(0);
 			return;
 		}
 	}
@@ -300,7 +300,7 @@ usage(void)
 }
 
 static void
-parent_shutdown(void)
+parent_shutdown(int ret)
 {
 	void		*iter;
 	struct child	*child;
@@ -318,7 +318,7 @@ parent_shutdown(void)
 	unlink(SMTPD_SOCKET);
 
 	log_warnx("warn: parent terminating");
-	exit(0);
+	exit(ret);
 }
 
 static void
@@ -327,48 +327,14 @@ parent_send_config(int fd, short event, void *p)
 	parent_send_config_lka();
 	parent_send_config_mfa();
 	parent_send_config_smtp();
-	purge_config(PURGE_SSL);
+	purge_config(PURGE_PKI);
 }
 
 static void
 parent_send_config_smtp(void)
 {
-	struct listener		*l;
-	struct ssl		*s;
-	void			*iter = NULL;
-	struct iovec		 iov[5];
-	int			 opt;
-
 	log_debug("debug: parent_send_config: configuring smtp");
 	m_compose(p_smtp, IMSG_CONF_START, 0, 0, -1, NULL, 0);
-
-	while (dict_iter(env->sc_ssl_dict, &iter, NULL, (void **)&s)) {
-		iov[0].iov_base = s;
-		iov[0].iov_len = sizeof(*s);
-		iov[1].iov_base = s->ssl_cert;
-		iov[1].iov_len = s->ssl_cert_len;
-		iov[2].iov_base = s->ssl_key;
-		iov[2].iov_len = s->ssl_key_len;
-		iov[3].iov_base = s->ssl_dhparams;
-		iov[3].iov_len = s->ssl_dhparams_len;
-		iov[4].iov_base = s->ssl_ca;
-		iov[4].iov_len = s->ssl_ca_len;
-		m_composev(p_smtp, IMSG_CONF_SSL, 0, 0, -1, iov, nitems(iov));
-	}
-
-	TAILQ_FOREACH(l, env->sc_listeners, entry) {
-		if ((l->fd = socket(l->ss.ss_family, SOCK_STREAM, 0)) == -1)
-			fatal("smtpd: socket");
-		opt = 1;
-		if (setsockopt(l->fd, SOL_SOCKET, SO_REUSEADDR, &opt,
-			sizeof(opt)) < 0)
-			fatal("smtpd: setsockopt");
-		if (bind(l->fd, (struct sockaddr *)&l->ss, l->ss.ss_len) == -1)
-			fatal("smtpd: bind");
-		m_compose(p_smtp, IMSG_CONF_LISTENER, 0, 0, l->fd,
-		    l, sizeof(*l));
-	}
-
 	m_compose(p_smtp, IMSG_CONF_END, 0, 0, -1, NULL, 0);
 }
 
@@ -390,93 +356,8 @@ parent_send_config_mfa()
 void
 parent_send_config_lka()
 {
-	struct rule	       *r;
-	struct table	       *t;
-	void		       *iter_tree;
-	void		       *iter_dict;
-	const char	       *k;
-	char		       *v;
-	char		       *buffer;
-	size_t			buflen;
-	struct ssl	       *s;
-	struct iovec		iov[5];
-
 	log_debug("debug: parent_send_config_ruleset: reloading");
 	m_compose(p_lka, IMSG_CONF_START, 0, 0, -1, NULL, 0);
-
-	iter_dict = NULL;
-	while (dict_iter(env->sc_ssl_dict, &iter_dict, NULL, (void **)&s)) {
-		iov[0].iov_base = s;
-		iov[0].iov_len = sizeof(*s);
-		iov[1].iov_base = s->ssl_cert;
-		iov[1].iov_len = s->ssl_cert_len;
-		iov[2].iov_base = s->ssl_key;
-		iov[2].iov_len = s->ssl_key_len;
-		iov[3].iov_base = s->ssl_dhparams;
-		iov[3].iov_len = s->ssl_dhparams_len;
-		iov[4].iov_base = s->ssl_ca;
-		iov[4].iov_len = s->ssl_ca_len;
-		m_composev(p_lka, IMSG_CONF_SSL, 0, 0, -1, iov, nitems(iov));
-	}
-
-	iter_tree = NULL;
-	while (dict_iter(env->sc_tables_dict, &iter_tree, NULL,
-		(void **)&t)) {
-		m_compose(p_lka, IMSG_CONF_TABLE, 0, 0, -1, t, sizeof(*t));
-
-		iter_dict = NULL;
-		while (dict_iter(&t->t_dict, &iter_dict, &k,
-			(void **)&v)) {
-			buflen = strlen(k) + 1;
-			if (v)
-				buflen += strlen(v) + 1;
-			buffer = xcalloc(1, buflen,
-			    "parent_send_config_ruleset");
-			memcpy(buffer, k, strlen(k) + 1);
-			if (v)
-				memcpy(buffer + strlen(k) + 1, v,
-				    strlen(v) + 1);
-			m_compose(p_lka, IMSG_CONF_TABLE_CONTENT, 0, 0, -1,
-			    buffer, buflen);
-			free(buffer);
-		}
-	}
-
-	TAILQ_FOREACH(r, env->sc_rules, r_entry) {
-		m_compose(p_lka, IMSG_CONF_RULE, 0, 0, -1, r, sizeof(*r));
-		m_compose(p_lka, IMSG_CONF_RULE_SOURCE, 0, 0, -1,
-		    &r->r_sources->t_name,
-		    sizeof(r->r_sources->t_name));
-		if (r->r_senders) {
-			m_compose(p_lka, IMSG_CONF_RULE_SENDER,
-			    0, 0, -1,
-			    &r->r_senders->t_name,
-			    sizeof(r->r_senders->t_name));
-		}
-		if (r->r_recipients) {
-			m_compose(p_lka, IMSG_CONF_RULE_RECIPIENT,
-			    0, 0, -1,
-			    &r->r_recipients->t_name,
-			    sizeof(r->r_recipients->t_name));
-		}
-		if (r->r_destination) {
-			m_compose(p_lka, IMSG_CONF_RULE_DESTINATION,
-			    0, 0, -1,
-			    &r->r_destination->t_name,
-			    sizeof(r->r_destination->t_name));
-		}
-		if (r->r_mapping) {
-			m_compose(p_lka, IMSG_CONF_RULE_MAPPING, 0, 0, -1,
-			    &r->r_mapping->t_name,
-			    sizeof(r->r_mapping->t_name));
-		}
-		if (r->r_userbase) {
-			m_compose(p_lka, IMSG_CONF_RULE_USERS, 0, 0, -1,
-			    &r->r_userbase->t_name,
-			    sizeof(r->r_userbase->t_name));
-		}
-	}
-
 	m_compose(p_lka, IMSG_CONF_END, 0, 0, -1, NULL, 0);
 }
 
@@ -575,7 +456,7 @@ parent_sig_handler(int sig, short event, void *p)
 		} while (pid > 0 || (pid == -1 && errno == EINTR));
 
 		if (die)
-			parent_shutdown();
+			parent_shutdown(1);
 		break;
 	default:
 		fatalx("smtpd: unexpected signal");
@@ -606,7 +487,7 @@ main(int argc, char *argv[])
 
 	TAILQ_INIT(&offline_q);
 
-	while ((c = getopt(argc, argv, "B:dD:nP:f:T:v")) != -1) {
+	while ((c = getopt(argc, argv, "B:dD:hnP:f:T:v")) != -1) {
 		switch (c) {
 		case 'B':
 			if (strstr(optarg, "queue=") == optarg)
@@ -628,6 +509,10 @@ main(int argc, char *argv[])
 				log_warnx("warn: "
 				    "could not parse macro definition %s",
 				    optarg);
+			break;
+		case 'h':
+			log_info("version: OpenSMTPD " SMTPD_VERSION);
+			usage();
 			break;
 		case 'n':
 			debug = 2;
@@ -715,7 +600,7 @@ main(int argc, char *argv[])
 		errx(1, "config file exceeds SMTPD_MAXPATHLEN");
 
 	if (env->sc_opts & SMTPD_OPT_NOACTION) {
-		load_ssl_tree();
+		load_pki_tree();
 		fprintf(stderr, "configuration OK\n");
 		exit(0);
 	}
@@ -742,6 +627,8 @@ main(int argc, char *argv[])
 	log_init(foreground);
 	log_verbose(verbose);
 
+	load_pki_tree();
+
 	log_info("info: %s %s starting", SMTPD_NAME, SMTPD_VERSION);
 
 	if (! foreground)
@@ -764,7 +651,6 @@ main(int argc, char *argv[])
 		errx(1, "machine does not have a hostname set");
 	env->sc_uptime = time(NULL);
 
-	load_ssl_tree();
 	fork_peers();
 
 	config_process(PROC_PARENT);
@@ -792,7 +678,7 @@ main(int argc, char *argv[])
 	config_done();
 
 	evtimer_set(&config_ev, parent_send_config, NULL);
-	bzero(&tv, sizeof(tv));
+	memset(&tv, 0, sizeof(tv));
 	evtimer_add(&config_ev, &tv);
 
 	/* defer offline scanning for a second */
@@ -817,34 +703,32 @@ main(int argc, char *argv[])
 }
 
 static void
-load_ssl_tree(void)
+load_pki_tree(void)
 {
-	struct ssl	*ssl;
-	void		*iter_dict;
+	struct pki	*pki;
 	const char	*k;
-	
+	void		*iter_dict;
 
 	log_debug("debug: init ssl-tree");
 	iter_dict = NULL;
-	while (dict_iter(env->sc_ssl_dict, &iter_dict, &k, (void **)&ssl)) {
-		log_debug("debug: loading pki information for %s", k);
+	while (dict_iter(env->sc_pki_dict, &iter_dict, &k, (void **)&pki)) {
+		log_debug("info: loading pki information for %s", k);
+		if (pki->pki_cert_file == NULL)
+			fatalx("load_pki_tree: missing certificate file");
+		if (pki->pki_key_file == NULL)
+			fatalx("load_pki_tree: missing key file");
 
-		if (ssl->ssl_cert_file == NULL)
-			errx(1, "load_ssl_tree: missing certificate file for %s", k);
-		if (ssl->ssl_key_file == NULL)
-			errx(1, "load_ssl_tree: missing key file for %s", k);
+		if (! ssl_load_certificate(pki, pki->pki_cert_file))
+			fatalx("load_pki_tree: failed to load certificate file");
+		if (! ssl_load_keyfile(pki, pki->pki_key_file, k))
+			fatalx("load_pki_tree: failed to load key file");
 
-		if (! ssl_load_certificate(ssl, ssl->ssl_cert_file))
-			errx(1, "load_ssl_tree: failed to load certificate file for %s", k);
-		if (! ssl_load_keyfile(ssl, ssl->ssl_key_file))
-			errx(1, "load_ssl_tree: failed to load certificate file for %s", k);
-
-		if (ssl->ssl_ca_file)
-			if (! ssl_load_cafile(ssl, ssl->ssl_ca_file))
-				errx(1, "load_ssl_tree: failed to load CA file for %s", k);
-		if (ssl->ssl_dhparams_file)
-			if (! ssl_load_dhparams(ssl, ssl->ssl_dhparams_file))
-				errx(1, "load_ssl_tree: failed to load dhparams file for %s", k);
+		if (pki->pki_ca_file)
+			if (! ssl_load_cafile(pki, pki->pki_ca_file))
+				fatalx("load_pki_tree: failed to load CA file");
+		if (pki->pki_dhparams_file)
+			if (! ssl_load_dhparams(pki, pki->pki_dhparams_file))
+				fatalx("load_pki_tree: failed to load dhparams file");
 	}
 }
 
@@ -852,21 +736,6 @@ static void
 fork_peers(void)
 {
 	tree_init(&children);
-
-	/*
-	 * Pick descriptor limit that will guarantee impossibility of fd
-	 * starvation condition.  The logic:
-	 *
-	 * Treat hardlimit as 100%.
-	 * Limit smtp to 50% (inbound connections)
-	 * Limit mta to 50% (outbound connections)
-	 * Limit mda to 50% (local deliveries)
-	 * In all three above, compute max session limit by halving the fd
-	 * limit (50% -> 25%), because each session costs two fds.
-	 * Limit queue to 100% to cover the extreme case when tons of fds are
-	 * opened for all four possible purposes (smtp, mta, mda, bounce)
-	 */
-	fdlimit(0.5);
 
 	init_pipes();
 
@@ -887,6 +756,7 @@ post_fork(int proc)
 {
 	if (proc != PROC_QUEUE && env->sc_queue_key)
 		memset(env->sc_queue_key, 0, strlen(env->sc_queue_key));
+
 	if (proc != PROC_CONTROL) {
 		close(control_socket);
 		control_socket = -1;
@@ -1151,7 +1021,7 @@ offline_enqueue(char *name)
 		size_t	 len;
 		arglist	 args;
 
-		bzero(&args, sizeof(args));
+		memset(&args, 0, sizeof(args));
 
 		if (lstat(path, &sb) == -1) {
 			log_warn("warn: smtpd: lstat: %s", path);
@@ -1324,7 +1194,7 @@ imsg_dispatch(struct mproc *p, struct imsg *imsg)
 		clock_gettime(CLOCK_MONOTONIC, &t1);
 		timespecsub(&t1, &t0, &dt);
 
-		log_debug("profile-imsg: %s %s %s %i %lld.%06li",
+		log_debug("profile-imsg: %s %s %s %d %lld.%06ld",
 		    proc_name(smtpd_process),
 		    proc_name(p->proc),
 		    imsg_to_str(imsg->hdr.type),
@@ -1357,7 +1227,7 @@ log_imsg(int to, int from, struct imsg *imsg)
 		return;
 
 	if (imsg->fd != -1)
-		log_trace(TRACE_IMSG, "imsg: %s <- %s: %s (len=%zu, fd=%i)",
+		log_trace(TRACE_IMSG, "imsg: %s <- %s: %s (len=%zu, fd=%d)",
 		    proc_name(to),
 		    proc_name(from),
 		    imsg_to_str(imsg->hdr.type),
@@ -1466,6 +1336,9 @@ imsg_to_str(int type)
 	CASE(IMSG_CTL_MTA_SHOW_RELAYS);
 	CASE(IMSG_CTL_MTA_SHOW_ROUTES);
 	CASE(IMSG_CTL_MTA_SHOW_HOSTSTATS);
+	CASE(IMSG_CTL_MTA_BLOCK);
+	CASE(IMSG_CTL_MTA_UNBLOCK);
+	CASE(IMSG_CTL_MTA_SHOW_BLOCK);
 
 	CASE(IMSG_CONF_START);
 	CASE(IMSG_CONF_SSL);
@@ -1476,6 +1349,7 @@ imsg_to_str(int type)
 	CASE(IMSG_CONF_RULE_SOURCE);
 	CASE(IMSG_CONF_RULE_SENDER);
 	CASE(IMSG_CONF_RULE_DESTINATION);
+	CASE(IMSG_CONF_RULE_RECIPIENT);
 	CASE(IMSG_CONF_RULE_MAPPING);
 	CASE(IMSG_CONF_RULE_USERS);
 	CASE(IMSG_CONF_FILTER);
@@ -1515,7 +1389,6 @@ imsg_to_str(int type)
 	CASE(IMSG_MFA_EVENT_COMMIT);
 	CASE(IMSG_MFA_EVENT_ROLLBACK);
 	CASE(IMSG_MFA_EVENT_DISCONNECT);
-	CASE(IMSG_MFA_SMTP_DATA);
 	CASE(IMSG_MFA_SMTP_RESPONSE);
 
 	CASE(IMSG_MTA_TRANSFER);

@@ -75,7 +75,7 @@ in6addr_to_text(const struct in6_addr *addr)
 	struct sockaddr_in6	sa_in6;
 	uint16_t		tmp16;
 
-	bzero(&sa_in6, sizeof(sa_in6));
+	memset(&sa_in6, 0, sizeof(sa_in6));
 	sa_in6.sin6_len = sizeof(sa_in6);
 	sa_in6.sin6_family = AF_INET6;
 	memcpy(&sa_in6.sin6_addr, addr, sizeof(sa_in6.sin6_addr));
@@ -102,7 +102,7 @@ text_to_mailaddr(struct mailaddr *maddr, const char *email)
 	if (strlcpy(buffer, email, sizeof buffer) >= sizeof buffer)
 		return 0;
 
-	bzero(maddr, sizeof *maddr);
+	memset(maddr, 0, sizeof *maddr);
 
 	username = buffer;
 	hostname = strrchr(username, '@');
@@ -240,19 +240,19 @@ duration_to_text(time_t t)
 	d = t / 24;
 
 	if (d) {
-		snprintf(buf, sizeof buf, "%llid", d);
+		snprintf(buf, sizeof buf, "%lldd", d);
 		strlcat(dst, buf, sizeof dst);
 	}
 	if (h) {
-		snprintf(buf, sizeof buf, "%ih", h);
+		snprintf(buf, sizeof buf, "%dh", h);
 		strlcat(dst, buf, sizeof dst);
 	}
 	if (m) {
-		snprintf(buf, sizeof buf, "%im", m);
+		snprintf(buf, sizeof buf, "%dm", m);
 		strlcat(dst, buf, sizeof dst);
 	}
 	if (s) {
-		snprintf(buf, sizeof buf, "%is", s);
+		snprintf(buf, sizeof buf, "%ds", s);
 		strlcat(dst, buf, sizeof dst);
 	}
 
@@ -267,8 +267,8 @@ text_to_netaddr(struct netaddr *netaddr, const char *s)
 	struct sockaddr_in6	ssin6;
 	int			bits;
 
-	bzero(&ssin, sizeof(struct sockaddr_in));
-	bzero(&ssin6, sizeof(struct sockaddr_in6));
+	memset(&ssin, 0, sizeof(struct sockaddr_in));
+	memset(&ssin6, 0, sizeof(struct sockaddr_in6));
 
 	if (strncasecmp("IPv6:", s, 5) == 0)
 		s += 5;
@@ -345,7 +345,7 @@ text_to_relayhost(struct relayhost *relay, const char *s)
 	size_t		i;
 	int		len;
 
-	bzero(buffer, sizeof buffer);
+	memset(buffer, 0, sizeof buffer);
 	if (strlcpy(buffer, s, sizeof buffer) >= sizeof buffer)
 		return 0;
 
@@ -414,9 +414,10 @@ relayhost_to_text(const struct relayhost *relay)
 {
 	static char	buf[4096];
 	char		port[4096];
+	uint16_t	mask = F_SMTPS|F_STARTTLS|F_AUTH|F_TLS_OPTIONAL|F_LMTP;
 
-	bzero(buf, sizeof buf);
-	switch (relay->flags) {
+	memset(buf, 0, sizeof buf);
+	switch (relay->flags & mask) {
 	case F_SMTPS|F_STARTTLS|F_AUTH:
 		strlcat(buf, "secure+auth://", sizeof buf);
 		break;
@@ -429,16 +430,10 @@ relayhost_to_text(const struct relayhost *relay)
 	case F_SMTPS|F_AUTH:
 		strlcat(buf, "smtps+auth://", sizeof buf);
 		break;
-	case F_STARTTLS|F_TLS_VERIFY:
-		strlcat(buf, "tls://", sizeof buf);
-		break;
 	case F_STARTTLS:
 		strlcat(buf, "tls://", sizeof buf);
 		break;
 	case F_SMTPS:
-		strlcat(buf, "smtps://", sizeof buf);
-		break;
-	case F_SMTPS|F_TLS_VERIFY:
 		strlcat(buf, "smtps://", sizeof buf);
 		break;
 	case F_BACKUP:
@@ -508,7 +503,7 @@ rule_to_text(struct rule *r)
 {
 	static char buf[4096];
 
-	bzero(buf, sizeof buf);
+	memset(buf, 0, sizeof buf);
 	strlcpy(buf, r->r_decision == R_ACCEPT  ? "accept" : "reject", sizeof buf);
 	if (r->r_tag[0]) {
 		strlcat(buf, " tagged ", sizeof buf);
@@ -595,7 +590,7 @@ text_to_userinfo(struct userinfo *userinfo, const char *s)
 	char	       *p;
 	const char     *errstr;
 
-	bzero(buf, sizeof buf);
+	memset(buf, 0, sizeof buf);
 	p = buf;
 	while (*s && *s != ':')
 		*p++ = *s++;
@@ -606,7 +601,7 @@ text_to_userinfo(struct userinfo *userinfo, const char *s)
 		sizeof userinfo->username) >= sizeof userinfo->username)
 		goto error;
 
-	bzero(buf, sizeof buf);
+	memset(buf, 0, sizeof buf);
 	p = buf;
 	while (*s && *s != ':')
 		*p++ = *s++;
@@ -616,7 +611,7 @@ text_to_userinfo(struct userinfo *userinfo, const char *s)
 	if (errstr)
 		goto error;
 
-	bzero(buf, sizeof buf);
+	memset(buf, 0, sizeof buf);
 	p = buf;
 	while (*s && *s != ':')
 		*p++ = *s++;
@@ -654,7 +649,7 @@ text_to_credentials(struct credentials *creds, const char *s)
 
 	offset = p - s;
 
-	bzero(buffer, sizeof buffer);
+	memset(buffer, 0, sizeof buffer);
 	if (strlcpy(buffer, s, sizeof buffer) >= sizeof buffer)
 		return 0;
 	p = buffer + offset;
@@ -712,27 +707,39 @@ expandnode_to_text(struct expandnode *expandnode)
 static int
 alias_is_filter(struct expandnode *alias, const char *line, size_t len)
 {
-	if (*line == '|') {
-		if (strlcpy(alias->u.buffer, line + 1,
-			sizeof(alias->u.buffer)) >= sizeof(alias->u.buffer))
+	int	v = 0;
+
+	if (*line == '"')
+		v = 1;
+	if (*(line+v) == '|') {
+		if (strlcpy(alias->u.buffer, line + v + 1,
+		    sizeof(alias->u.buffer)) >= sizeof(alias->u.buffer))
 			return 0;
+		if (v) {
+			v = strlen(alias->u.buffer);
+			if (v == 0)
+				return (0);
+			if (alias->u.buffer[v-1] != '"')
+				return (0);
+			alias->u.buffer[v-1] = '\0';
+		}
 		alias->type = EXPAND_FILTER;
-		return 1;
+		return (1);
 	}
-	return 0;
+	return (0);
 }
 
 static int
 alias_is_username(struct expandnode *alias, const char *line, size_t len)
 {
-	bzero(alias, sizeof *alias);
+	memset(alias, 0, sizeof *alias);
 
 	if (strlcpy(alias->u.user, line,
 	    sizeof(alias->u.user)) >= sizeof(alias->u.user))
 		return 0;
 
 	while (*line) {
-		if (!isalnum((int)*line) &&
+		if (!isalnum((unsigned char)*line) &&
 		    *line != '_' && *line != '.' && *line != '-')
 			return 0;
 		++line;
@@ -747,7 +754,7 @@ alias_is_address(struct expandnode *alias, const char *line, size_t len)
 {
 	char *domain;
 
-	bzero(alias, sizeof *alias);
+	memset(alias, 0, sizeof *alias);
 
 	if (len < 3)	/* x@y */
 		return 0;
@@ -768,7 +775,7 @@ alias_is_address(struct expandnode *alias, const char *line, size_t len)
 
 	while (*line) {
 		char allowedset[] = "!#$%*/?|^{}`~&'+-=_.";
-		if (!isalnum((int)*line) &&
+		if (!isalnum((unsigned char)*line) &&
 		    strchr(allowedset, *line) == NULL)
 			return 0;
 		++line;
@@ -776,7 +783,7 @@ alias_is_address(struct expandnode *alias, const char *line, size_t len)
 
 	while (*domain) {
 		char allowedset[] = "-.";
-		if (!isalnum((int)*domain) &&
+		if (!isalnum((unsigned char)*domain) &&
 		    strchr(allowedset, *domain) == NULL)
 			return 0;
 		++domain;
@@ -789,7 +796,7 @@ alias_is_address(struct expandnode *alias, const char *line, size_t len)
 static int
 alias_is_filename(struct expandnode *alias, const char *line, size_t len)
 {
-	bzero(alias, sizeof *alias);
+	memset(alias, 0, sizeof *alias);
 
 	if (*line != '/')
 		return 0;
@@ -806,7 +813,7 @@ alias_is_include(struct expandnode *alias, const char *line, size_t len)
 {
 	size_t skip;
 
-	bzero(alias, sizeof *alias);
+	memset(alias, 0, sizeof *alias);
 
 	if (strncasecmp(":include:", line, 9) == 0)
 		skip = 9;
@@ -827,7 +834,7 @@ alias_is_error(struct expandnode *alias, const char *line, size_t len)
 {
 	size_t	skip;
 
-	bzero(alias, sizeof *alias);
+	memset(alias, 0, sizeof *alias);
 
 	if (strncasecmp(":error:", line, 7) == 0)
 		skip = 7;
@@ -844,9 +851,11 @@ alias_is_error(struct expandnode *alias, const char *line, size_t len)
 		return 0;
 
 	/* [45][0-9]{2} [a-zA-Z0-9].* */
-	if (alias->u.buffer[3] != ' ' || !isalnum(alias->u.buffer[4]) ||
+	if (alias->u.buffer[3] != ' ' ||
+	    !isalnum((unsigned char)alias->u.buffer[4]) ||
 	    (alias->u.buffer[0] != '4' && alias->u.buffer[0] != '5') ||
-	    !isdigit(alias->u.buffer[1]) || !isdigit(alias->u.buffer[2]))
+	    !isdigit((unsigned char)alias->u.buffer[1]) ||
+	    !isdigit((unsigned char)alias->u.buffer[2]))
 		return 0;
 
 	alias->type = EXPAND_ERROR;

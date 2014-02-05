@@ -48,6 +48,7 @@
 #define PATH_GZCAT	"/usr/bin/gzcat"
 #define	PATH_CAT	"/bin/cat"
 #define PATH_QUEUE	"/queue"
+#define PATH_ENCRYPT	"/usr/bin/encrypt"
 
 int srv_connect(void);
 
@@ -108,7 +109,7 @@ srv_connect(void)
 	if ((ctl_sock = socket(AF_UNIX, SOCK_STREAM, 0)) == -1)
 		err(1, "socket");
 
-	bzero(&sun, sizeof(sun));
+	memset(&sun, 0, sizeof(sun));
 	sun.sun_family = AF_UNIX;
 	strlcpy(sun.sun_path, SMTPD_SOCKET, sizeof(sun.sun_path));
 	if (connect(ctl_sock, (struct sockaddr *)&sun, sizeof(sun)) == -1) {
@@ -118,8 +119,7 @@ srv_connect(void)
 		return (0);
 	}
 
-	if ((ibuf = calloc(1, sizeof(struct imsgbuf))) == NULL)
-		err(1, "calloc");
+	ibuf = xcalloc(1, sizeof(struct imsgbuf), "smtpctl:srv_connect");
 	imsg_init(ibuf, ctl_sock);
 
 	return (1);
@@ -135,9 +135,6 @@ srv_flush(void)
 static void
 srv_send(int msg, const void *data, size_t len)
 {
-#if 0
-	printf("SEND: %i (%zu)\n", msg, len);
-#endif
 	if (ibuf == NULL && !srv_connect())
 		errx(1, "smtpd doesn't seem to be running");
 	imsg_compose(ibuf, msg, IMSG_VERSION, 0, -1, data, len);
@@ -154,10 +151,6 @@ srv_recv(int type)
 		if ((n = imsg_get(ibuf, &imsg)) == -1)
 			errx(1, "imsg_get error");
 		if (n) {
-#if 0
-			printf("RECV: %i (%zu)\n", imsg.hdr.type,
-			    imsg.hdr.len - sizeof(imsg.hdr));
-#endif
 			if (imsg.hdr.type == IMSG_CTL_FAIL &&
 			    imsg.hdr.peerid != 0 &&
 			    imsg.hdr.peerid != IMSG_VERSION)
@@ -417,7 +410,7 @@ do_monitor(int argc, struct parameter *argv)
 	struct stat_digest	last, digest;
 	size_t			count;
 
-	bzero(&last, sizeof(last));
+	memset(&last, 0, sizeof(last));
 	count = 0;
 
 	while (1) {
@@ -715,7 +708,7 @@ do_show_stats(int argc, struct parameter *argv)
 	struct stat_kv	kv;
 	time_t		duration;
 
-	bzero(&kv, sizeof kv);
+	memset(&kv, 0, sizeof kv);
 
 	while (1) {
 		srv_send(IMSG_STATS_GET, &kv, sizeof kv);
@@ -748,7 +741,7 @@ do_show_stats(int argc, struct parameter *argv)
 				    (long long)kv.val.u.tv.tv_usec);
 				break;
 			case STAT_TIMESPEC:
-				printf("%s=%lli.%06li\n",
+				printf("%s=%lld.%06ld\n",
 				    kv.key,
 				    (long long)kv.val.u.ts.tv_sec * 1000000 +
 				    kv.val.u.ts.tv_nsec / 1000000,
@@ -810,6 +803,62 @@ do_update_table(int argc, struct parameter *argv)
 	return srv_check_result(1);
 }
 
+static int
+do_encrypt(int argc, struct parameter *argv)
+{
+	const char *p = NULL;
+
+	if (argv)
+		p = argv[0].u.u_str;
+	execl(PATH_ENCRYPT, "encrypt", p, NULL);
+	errx(1, "execl");
+}
+
+static int
+do_block_mta(int argc, struct parameter *argv)
+{
+	struct ibuf *m;
+
+	if (ibuf == NULL && !srv_connect())
+		errx(1, "smtpd doesn't seem to be running");
+	m = imsg_create(ibuf, IMSG_CTL_MTA_BLOCK, IMSG_VERSION, 0,
+	    sizeof(argv[0].u.u_ss) + strlen(argv[1].u.u_str) + 1);
+	if (imsg_add(m, &argv[0].u.u_ss, sizeof(argv[0].u.u_ss)) == -1)
+		errx(1, "imsg_add");
+	if (imsg_add(m, argv[1].u.u_str, strlen(argv[1].u.u_str) + 1) == -1)
+		errx(1, "imsg_add");
+	imsg_close(ibuf, m);
+
+	return srv_check_result(1);
+}
+
+static int
+do_unblock_mta(int argc, struct parameter *argv)
+{
+	struct ibuf *m;
+
+	if (ibuf == NULL && !srv_connect())
+		errx(1, "smtpd doesn't seem to be running");
+
+	m = imsg_create(ibuf, IMSG_CTL_MTA_UNBLOCK, IMSG_VERSION, 0,
+	    sizeof(argv[0].u.u_ss) + strlen(argv[1].u.u_str) + 1);
+	if (imsg_add(m, &argv[0].u.u_ss, sizeof(argv[0].u.u_ss)) == -1)
+		errx(1, "imsg_add");
+	if (imsg_add(m, argv[1].u.u_str, strlen(argv[1].u.u_str) + 1) == -1)
+		errx(1, "imsg_add");
+	imsg_close(ibuf, m);
+
+	return srv_check_result(1);
+}
+
+static int
+do_show_mta_block(int argc, struct parameter *argv)
+{
+	srv_show_cmd(IMSG_CTL_MTA_SHOW_BLOCK, NULL, 0);
+
+	return (0);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -824,6 +873,11 @@ main(int argc, char **argv)
 	if (geteuid())
 		errx(1, "need root privileges");
 
+	cmd_install("encrypt",			do_encrypt);
+	cmd_install("encrypt <str>",		do_encrypt);
+	cmd_install("pause mta from <addr> for <str>", do_block_mta);
+	cmd_install("resume mta from <addr> for <str>", do_unblock_mta);
+	cmd_install("show mta paused",		do_show_mta_block);
 	cmd_install("log brief",		do_log_brief);
 	cmd_install("log verbose",		do_log_verbose);
 	cmd_install("monitor",			do_monitor);
@@ -971,9 +1025,10 @@ show_offline_envelope(uint64_t evpid)
 	if (fp == NULL)
 		goto end;
 
-	buflen = fread(buffer, 1, sizeof buffer, fp);
+	buflen = fread(buffer, 1, sizeof (buffer) - 1, fp);
 	p = buffer;
 	plen = buflen;
+	buffer[buflen] = '\0';
 
 	if (is_encrypted_buffer(p)) {
 		warnx("offline encrypted queue is not supported yet");
