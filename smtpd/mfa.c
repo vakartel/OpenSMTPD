@@ -307,6 +307,8 @@ mfa_tx(uint64_t reqid, int fdout)
 	struct mfa_tx	*tx;
 	int		 sp[2];
 
+	MONKEY_RETURN(-1);
+
 	if (socketpair(AF_UNIX, SOCK_STREAM, PF_UNSPEC, sp) == -1) {
 		log_warn("warn: mfa: socketpair");
 		return (-1);
