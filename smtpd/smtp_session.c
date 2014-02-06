@@ -389,7 +389,6 @@ smtp_session_imsg(struct mproc *p, struct imsg *imsg)
 		m_get_id(&m, &reqid);
 		m_get_int(&m, &success);
 		m_end(&m);
-
 		s = tree_xpop(&wait_queue_fd, reqid);
 		if (!success || imsg->fd == -1) {
 			if (imsg->fd != -1)
@@ -1124,7 +1123,7 @@ smtp_command(struct smtp_session *s, char *line)
 			break;
 		}
 		strlcpy(s->helo, args, sizeof(s->helo));
-		s->flags &= SF_SECURE | SF_AUTHENTICATED | SF_VERIFIED;
+		s->flags &= SF_SECURE | SF_AUTHENTICATED | SF_VERIFIED | SF_MFACONNSENT;
 		if (cmd == CMD_EHLO) {
 			s->flags |= SF_EHLO;
 			s->flags |= SF_8BITMIME;
@@ -1785,13 +1784,11 @@ smtp_free(struct smtp_session *s, const char * reason)
 		m_add_msgid(p_queue, evpid_to_msgid(s->evp.id));
 		m_close(p_queue);
 	}
-
 	if (s->flags & SF_MFACONNSENT) {
 		m_create(p_mfa, IMSG_MFA_EVENT_DISCONNECT, 0, 0, -1);
 		m_add_id(p_mfa, s->id);
 		m_close(p_mfa);
 	}
-
 	if (s->flags & SF_SECURE && s->listener->flags & F_SMTPS)
 		stat_decrement("smtp.smtps", 1);
 	if (s->flags & SF_SECURE && s->listener->flags & F_STARTTLS)
