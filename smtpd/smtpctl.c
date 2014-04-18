@@ -414,8 +414,8 @@ do_monitor(int argc, struct parameter *argv)
 	count = 0;
 
 	while (1) {
-		srv_send(IMSG_DIGEST, NULL, 0);
-		srv_recv(IMSG_DIGEST);
+		srv_send(IMSG_CTL_GET_DIGEST, NULL, 0);
+		srv_recv(IMSG_CTL_GET_DIGEST);
 		srv_read(&digest, sizeof(digest));
 		srv_end();
 
@@ -711,8 +711,8 @@ do_show_stats(int argc, struct parameter *argv)
 	memset(&kv, 0, sizeof kv);
 
 	while (1) {
-		srv_send(IMSG_STATS_GET, &kv, sizeof kv);
-		srv_recv(IMSG_STATS_GET);
+		srv_send(IMSG_CTL_GET_STATS, &kv, sizeof kv);
+		srv_recv(IMSG_CTL_GET_STATS);
 		srv_read(&kv, sizeof(kv));
 		srv_end();
 
@@ -755,6 +755,24 @@ do_show_stats(int argc, struct parameter *argv)
 }
 
 static int
+do_show_status(int argc, struct parameter *argv)
+{
+	uint32_t	sc_flags;
+
+	srv_send(IMSG_CTL_SHOW_STATUS, NULL, 0);
+	srv_recv(IMSG_CTL_SHOW_STATUS);
+	srv_read(&sc_flags, sizeof(sc_flags));
+	srv_end();
+	printf("MDA %s\n",
+	    (sc_flags & SMTPD_MDA_PAUSED) ? "paused" : "running");
+	printf("MTA %s\n",
+	    (sc_flags & SMTPD_MTA_PAUSED) ? "paused" : "running");
+	printf("SMTP %s\n",
+	    (sc_flags & SMTPD_SMTP_PAUSED) ? "paused" : "running");
+	return (0);
+}
+
+static int
 do_stop(int argc, struct parameter *argv)
 {
 	srv_send(IMSG_CTL_SHUTDOWN, NULL, 0);
@@ -768,7 +786,7 @@ do_trace(int argc, struct parameter *argv)
 
 	v = str_to_trace(argv[0].u.u_str);
 
-	srv_send(IMSG_CTL_TRACE, &v, sizeof(v));
+	srv_send(IMSG_CTL_TRACE_ENABLE, &v, sizeof(v));
 	return srv_check_result(1);
 }
 
@@ -779,7 +797,7 @@ do_unprofile(int argc, struct parameter *argv)
 
 	v = str_to_profile(argv[0].u.u_str);
 
-	srv_send(IMSG_CTL_UNPROFILE, &v, sizeof(v));
+	srv_send(IMSG_CTL_PROFILE_DISABLE, &v, sizeof(v));
 	return srv_check_result(1);
 }
 
@@ -790,7 +808,7 @@ do_untrace(int argc, struct parameter *argv)
 
 	v = str_to_trace(argv[0].u.u_str);
 
-	srv_send(IMSG_CTL_UNTRACE, &v, sizeof(v));
+	srv_send(IMSG_CTL_TRACE_DISABLE, &v, sizeof(v));
 	return srv_check_result(1);
 }
 
@@ -799,7 +817,7 @@ do_update_table(int argc, struct parameter *argv)
 {
 	const char	*name = argv[0].u.u_str;
 
-	srv_send(IMSG_LKA_UPDATE_TABLE, name, strlen(name) + 1);
+	srv_send(IMSG_CTL_UPDATE_TABLE, name, strlen(name) + 1);
 	return srv_check_result(1);
 }
 
@@ -908,6 +926,7 @@ main(int argc, char **argv)
 	cmd_install("show relays",		do_show_relays);
 	cmd_install("show routes",		do_show_routes);
 	cmd_install("show stats",		do_show_stats);
+	cmd_install("show status",		do_show_status);
 	cmd_install("stop",			do_stop);
 	cmd_install("trace <str>",		do_trace);
 	cmd_install("unprofile <str>",		do_unprofile);

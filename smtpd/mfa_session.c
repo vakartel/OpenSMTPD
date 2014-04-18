@@ -85,6 +85,7 @@ struct mfa_query {
 	int			 state;
 	int			 hasrun;
 	struct mfa_filter	*current;
+	struct tree		 notify;  /* list of filters to notify */
 
 	/* current data */
 	union {
@@ -115,13 +116,11 @@ static void mfa_set_fdout(struct mfa_session *, int);
 static TAILQ_HEAD(, mfa_filterproc)	procs;
 struct dict				chains;
 
-static const char * mfa_event_to_text(struct mfa_query *);
 static const char * mfa_query_to_text(struct mfa_query *);
 static const char * mfa_filter_to_text(struct mfa_filter *);
 static const char * mfa_filterproc_to_text(struct mfa_filterproc *);
 static const char * type_to_str(int);
 static const char * hook_to_str(int);
-static const char * event_to_str(int);
 static const char * status_to_str(int);
 static const char * filterimsg_to_str(int);
 
@@ -276,36 +275,18 @@ mfa_filter_init(void)
 }
 
 void
-mfa_filter_event(uint64_t id, int hook)
-{
-	struct mfa_session	*s;
-	struct mfa_query	*q;
-
-	if (hook == EVENT_CONNECT) {
-		s = xcalloc(1, sizeof(*s), "mfa_filter_event");
-		s->id = id;
-		s->filters = dict_xget(&chains, "default");
-		TAILQ_INIT(&s->queries);
-		tree_xset(&sessions, s->id, s);
-	}
-	else if (hook == EVENT_DISCONNECT)
-		/* On disconnect, the session is virtualy dead */
-		s = tree_xpop(&sessions, id);
-	else
-		s = tree_xget(&sessions, id);
-	q = mfa_query(s, QT_EVENT, hook);
-
-	mfa_drain_query(q);
-}
-
-void
 mfa_filter_connect(uint64_t id, const struct sockaddr *local,
 	const struct sockaddr *remote, const char *host)
 {
 	struct mfa_session	*s;
 	struct mfa_query	*q;
 
-	s = tree_xget(&sessions, id);
+	s = xcalloc(1, sizeof(*s), "mfa_query_connect");
+	s->id = id;
+	s->filters = dict_xget(&chains, "default");
+	TAILQ_INIT(&s->queries);
+	tree_xset(&sessions, s->id, s);
+
 	q = mfa_query(s, QT_QUERY, HOOK_CONNECT);
 
 	memmove(&q->u.connect.local, local, local->sa_len);
@@ -315,6 +296,22 @@ mfa_filter_connect(uint64_t id, const struct sockaddr *local,
 	q->smtp.status = MFA_OK;
 	q->smtp.code = 0;
 	q->smtp.response = NULL;
+
+	mfa_drain_query(q);
+}
+
+void
+mfa_filter_event(uint64_t id, int hook)
+{
+	struct mfa_session	*s;
+	struct mfa_query	*q;
+
+	/* On disconnect, the session is virtualy dead */
+	if (hook == HOOK_DISCONNECT)
+		s = tree_xpop(&sessions, id);
+	else
+		s = tree_xget(&sessions, id);
+	q = mfa_query(s, QT_EVENT, hook);
 
 	mfa_drain_query(q);
 }
@@ -392,10 +389,10 @@ mfa_set_fdout(struct mfa_session *s, int fdout)
 
 	log_trace(TRACE_MFA, "mfa: chain input is %d", fdout);
 
-	m_create(p_smtp, IMSG_QUEUE_MESSAGE_FILE, 0, 0, fdout);
-	m_add_id(p_smtp, s->id);
-	m_add_int(p_smtp, 1);
-	m_close(p_smtp);
+	m_create(p_pony, IMSG_SMTP_MESSAGE_OPEN, 0, 0, fdout); /* XXX bogus */
+	m_add_id(p_pony, s->id);
+	m_add_int(p_pony, 1);
+	m_close(p_pony);
 	return;
 }
 
@@ -419,18 +416,15 @@ mfa_query(struct mfa_session *s, int type, int hook)
 	q->session = s;
 	q->type = type;
 	q->hook = hook;
+	tree_init(&q->notify);
 	TAILQ_INSERT_TAIL(&s->queries, q, entry);
 
 	q->state = QUERY_READY;
 	q->current = TAILQ_FIRST(s->filters);
 	q->hasrun = 0;
 
-	if (type == QT_QUERY)
-		log_trace(TRACE_MFA, "filter: new query %s %s", type_to_str(type),
-		    hook_to_str(hook));
-	else
-		log_trace(TRACE_MFA, "filter: new query %s %s", type_to_str(type),
-		    event_to_str(hook));
+	log_trace(TRACE_MFA, "filter: new query %s %s", type_to_str(type),
+	    hook_to_str(hook));
 
 	return (q);
 }
@@ -493,28 +487,33 @@ mfa_drain_query(struct mfa_query *q)
 		    q->smtp.code,
 		    q->smtp.response);
 
-		/* ...and send the SMTP response */
-		if (q->hook == HOOK_EOM) {
-			mfa_report_eom(q->session->id, q->u.datalen);
+		/* Done, notify all listeners and return smtp response */
+		while (tree_poproot(&q->notify, NULL, (void**)&proc)) {
+			m_create(&proc->mproc, IMSG_FILTER_NOTIFY, 0, 0, -1);
+			m_add_id(&proc->mproc, q->qid);
+			m_add_int(&proc->mproc, q->smtp.status);
+			m_close(&proc->mproc);
 		}
-		else {
-			if (q->hook != HOOK_DISCONNECT &&
-			    q->hook != HOOK_COMMIT &&
-			    q->hook != HOOK_ROLLBACK &&
-			    q->hook != HOOK_RESET) {
-				m_create(p_smtp, IMSG_MFA_SMTP_RESPONSE, 0, 0, -1);
-				m_add_id(p_smtp, q->session->id);
-				m_add_int(p_smtp, q->smtp.status);
-				m_add_u32(p_smtp, q->smtp.code);
-				if (q->smtp.response)
-					m_add_string(p_smtp, q->smtp.response);
-				m_close(p_smtp);
-			}
-		}
+
+		m_create(p_pony, IMSG_MFA_SMTP_RESPONSE, 0, 0, -1);
+		m_add_id(p_pony, q->session->id);
+		m_add_int(p_pony, q->smtp.status);
+		m_add_u32(p_pony, q->smtp.code);
+		if (q->smtp.response)
+			m_add_string(p_pony, q->smtp.response);
+		m_close(p_pony);
+
 		free(q->smtp.response);
 	}
 
 	TAILQ_REMOVE(&q->session->queries, q, entry);
+	/* If the query was a disconnect event, the session can be freed */
+	if (q->hook == HOOK_DISCONNECT) {
+		/* XXX assert prev == NULL */
+		log_trace(TRACE_MFA, "filter: freeing session %016" PRIx64, q->session->id);
+		free(q->session);
+	}
+
 	log_trace(TRACE_MFA, "filter: freeing query %016" PRIx64, q->qid);
 	free(q);
 }
@@ -522,15 +521,16 @@ mfa_drain_query(struct mfa_query *q)
 static void
 mfa_run_query(struct mfa_filter *f, struct mfa_query *q)
 {
-	if (q->type == QT_QUERY) {
-		if ((f->proc->hooks & q->hook) == 0) {
-			log_trace(TRACE_MFA, "filter: skipping filter %s for query %s",
-			    mfa_filter_to_text(f), mfa_query_to_text(q));
-			return;
-		}
-		log_trace(TRACE_MFA, "filter: running filter %s for query %s",
+	if ((f->proc->hooks & q->hook) == 0) {
+		log_trace(TRACE_MFA, "filter: skipping filter %s for query %s",
 		    mfa_filter_to_text(f), mfa_query_to_text(q));
+		return;
+	}
 
+	log_trace(TRACE_MFA, "filter: running filter %s for query %s",
+	    mfa_filter_to_text(f), mfa_query_to_text(q));
+
+	if (q->type == QT_QUERY) {
 		m_create(&f->proc->mproc, IMSG_FILTER_QUERY, 0, 0, -1);
 		m_add_id(&f->proc->mproc, q->session->id);
 		m_add_id(&f->proc->mproc, q->qid);
@@ -563,9 +563,6 @@ mfa_run_query(struct mfa_filter *f, struct mfa_query *q)
 		q->state = QUERY_RUNNING;
 	}
 	else {
-		log_trace(TRACE_MFA, "filter: running filter %s for query %s",
-		    mfa_filter_to_text(f), mfa_query_to_text(q));
-
 		m_create(&f->proc->mproc, IMSG_FILTER_EVENT, 0, 0, -1);
 		m_add_id(&f->proc->mproc, q->session->id);
 		m_add_int(&f->proc->mproc, q->hook);
@@ -583,7 +580,7 @@ mfa_filter_imsg(struct mproc *p, struct imsg *imsg)
 	const char		*line;
 	uint64_t		 qid;
 	uint32_t		 datalen;
-	int			 qhook, status, code;
+	int			 qhook, status, code, notify;
 
 	if (imsg == NULL) {
 		log_warnx("warn: filter \"%s\" closed unexpectedly", p->name);
@@ -626,6 +623,7 @@ mfa_filter_imsg(struct mproc *p, struct imsg *imsg)
 			m_get_u32(&m, &datalen);
 		m_get_int(&m, &status);
 		m_get_int(&m, &code);
+		m_get_int(&m, &notify);
 		if (m_is_eom(&m))
 			line = NULL;
 		else
@@ -645,6 +643,8 @@ mfa_filter_imsg(struct mproc *p, struct imsg *imsg)
 			q->smtp.response = xstrdup(line, "mfa_filter_imsg");
 		}
 		q->state = (status == FILTER_OK) ? QUERY_READY : QUERY_DONE;
+		if (notify)
+			tree_xset(&q->notify, (uintptr_t)(proc), proc);
 		if (qhook == HOOK_EOM)
 			q->u.datalen = datalen;
 
@@ -675,6 +675,7 @@ mfa_filter_imsg(struct mproc *p, struct imsg *imsg)
 	}
 }
 
+
 static const char *
 mfa_query_to_text(struct mfa_query *q)
 {
@@ -683,35 +684,34 @@ mfa_query_to_text(struct mfa_query *q)
 
 	tmp[0] = '\0';
 
-	if (q->type == QT_QUERY) {
-		switch(q->hook) {
-		case HOOK_CONNECT:
-			strlcat(tmp, "=", sizeof tmp);
-			strlcat(tmp, ss_to_text(&q->u.connect.local), sizeof tmp);
-			strlcat(tmp, " <-> ", sizeof tmp);
-			strlcat(tmp, ss_to_text(&q->u.connect.remote), sizeof tmp);
-			strlcat(tmp, "(", sizeof tmp);
-			strlcat(tmp, q->u.connect.hostname, sizeof tmp);
-			strlcat(tmp, ")", sizeof tmp);
-			break;
-		case HOOK_MAIL:
-		case HOOK_RCPT:
-			snprintf(tmp, sizeof tmp, "=%s@%s",
-			    q->u.maddr.user, q->u.maddr.domain);
-			break;
-		case HOOK_HELO:
-			snprintf(tmp, sizeof tmp, "=%s", q->u.line);
-			break;
-		default:
-			break;
-		}
-		snprintf(buf, sizeof buf, "%016"PRIx64"[%s,%s%s]",
-		    q->qid, type_to_str(q->type), hook_to_str(q->hook), tmp);
+	switch(q->hook) {
+
+	case HOOK_CONNECT:
+		strlcat(tmp, "=", sizeof tmp);
+		strlcat(tmp, ss_to_text(&q->u.connect.local), sizeof tmp);
+		strlcat(tmp, " <-> ", sizeof tmp);
+		strlcat(tmp, ss_to_text(&q->u.connect.remote), sizeof tmp);
+		strlcat(tmp, "(", sizeof tmp);
+		strlcat(tmp, q->u.connect.hostname, sizeof tmp);
+		strlcat(tmp, ")", sizeof tmp);
+		break;
+
+	case HOOK_MAIL:
+	case HOOK_RCPT:
+		snprintf(tmp, sizeof tmp, "=%s@%s",
+		    q->u.maddr.user, q->u.maddr.domain);
+		break;
+
+	case HOOK_HELO:
+		snprintf(tmp, sizeof tmp, "=%s", q->u.line);
+		break;
+
+	default:
+		break;
 	}
-	else {
-		snprintf(buf, sizeof buf, "%016"PRIx64"[%s,%s%s]",
-		    q->qid, type_to_str(q->type), event_to_str(q->hook), tmp);
-	}
+
+	snprintf(buf, sizeof buf, "%016"PRIx64"[%s,%s%s]",
+	    q->qid, type_to_str(q->type), hook_to_str(q->hook), tmp);
 
 	return (buf);
 }
@@ -772,20 +772,6 @@ hook_to_str(int hook)
 	CASE(HOOK_DATALINE);
 	default:
 		return "HOOK_???";
-	}
-}
-
-static const char *
-event_to_str(int event)
-{
-	switch (event) {
-	CASE(EVENT_CONNECT);
-	CASE(EVENT_RESET);
-	CASE(EVENT_DISCONNECT);
-	CASE(EVENT_COMMIT);
-	CASE(EVENT_ROLLBACK);
-	default:
-		return "EVENT_???";
 	}
 }
 

@@ -84,8 +84,8 @@ enum message_flags {
 	MF_QUEUE_ENVELOPE_FAIL	= 0x0001,
 	MF_ERROR_SIZE		= 0x1000,
 	MF_ERROR_IO		= 0x2000,
+	MF_ERROR_MFA		= 0x4000,
 };
-#define MF_ERROR	(MF_ERROR_SIZE | MF_ERROR_IO)
 
 enum smtp_command {
 	CMD_HELO = 0,
@@ -123,8 +123,6 @@ struct smtp_session {
 	int			 phase;
 	enum smtp_state		 state;
 
-	enum imsg_type		 mfa_imsg; /* last send */
-
 	char			 helo[SMTPD_MAXLINESIZE];
 	char			 cmd[SMTPD_MAXLINESIZE];
 	char			 username[SMTPD_MAXLOGNAME];
@@ -141,10 +139,9 @@ struct smtp_session {
 	size_t			 rcptfail;
 	TAILQ_HEAD(, smtp_rcpt)	 rcpts;
 
+
 	size_t			 datalen;
-	struct iobuf		 dataiobuf;
-	struct io		 dataio;
-	int			 dataeom;
+	FILE			*ofile;
 
 	struct event		 pause;
 };
@@ -161,11 +158,9 @@ static void smtp_session_init(void);
 static int smtp_lookup_servername(struct smtp_session *);
 static void smtp_connected(struct smtp_session *);
 static void smtp_send_banner(struct smtp_session *);
-static void smtp_mfa_response(struct smtp_session *, int, uint32_t,
+static void smtp_mfa_response(struct smtp_session *, int, int, uint32_t,
     const char *);
 static void smtp_io(struct io *, int);
-static void smtp_data_io(struct io *, int);
-static void smtp_data_io_done(struct smtp_session *);
 static void smtp_enter_state(struct smtp_session *, int);
 static void smtp_reply(struct smtp_session *, char *, ...);
 static void smtp_command(struct smtp_session *, char *);
@@ -173,9 +168,9 @@ static int smtp_parse_mail_args(struct smtp_session *, char *);
 static int smtp_parse_rcpt_args(struct smtp_session *, char *);
 static void smtp_rfc4954_auth_plain(struct smtp_session *, char *);
 static void smtp_rfc4954_auth_login(struct smtp_session *, char *);
-static void smtp_message_line(struct smtp_session *, const char *);
+static void smtp_message_write(struct smtp_session *, const char *);
+static void smtp_message_end(struct smtp_session *);
 static void smtp_message_reset(struct smtp_session *, int);
-static void smtp_wait_mfa(struct smtp_session *s, int);
 static void smtp_free(struct smtp_session *, const char *);
 static const char *smtp_strstate(int);
 static int smtp_verify_certificate(struct smtp_session *);
@@ -183,6 +178,17 @@ static uint8_t dsn_notify_str_to_uint8(const char *);
 static void smtp_auth_failure_pause(struct smtp_session *);
 static void smtp_auth_failure_resume(int, short, void *);
 static int smtp_sni_callback(SSL *, int *, void *);
+
+static void smtp_filter_connect(struct smtp_session *, struct sockaddr *);
+static void smtp_filter_rset(struct smtp_session *);
+static void smtp_filter_disconnect(struct smtp_session *);
+static void smtp_filter_commit(struct smtp_session *);
+static void smtp_filter_rollback(struct smtp_session *);
+static void smtp_filter_eom(struct smtp_session *);
+static void smtp_filter_helo(struct smtp_session *);
+static void smtp_filter_mail(struct smtp_session *s);
+static void smtp_filter_rcpt(struct smtp_session *s);
+static void smtp_filter_data(struct smtp_session *s);
 
 static struct { int code; const char *cmd; } commands[] = {
 	{ CMD_HELO,		"HELO" },
@@ -203,7 +209,7 @@ static struct { int code; const char *cmd; } commands[] = {
 static struct tree wait_lka_ptr;
 static struct tree wait_lka_helo;
 static struct tree wait_lka_rcpt;
-static struct tree wait_mfa_response;
+static struct tree wait_mfa_data;
 static struct tree wait_parent_auth;
 static struct tree wait_queue_msg;
 static struct tree wait_queue_fd;
@@ -220,7 +226,7 @@ smtp_session_init(void)
 		tree_init(&wait_lka_ptr);
 		tree_init(&wait_lka_helo);
 		tree_init(&wait_lka_rcpt);
-		tree_init(&wait_mfa_response);
+		tree_init(&wait_mfa_data);
 		tree_init(&wait_parent_auth);
 		tree_init(&wait_queue_msg);
 		tree_init(&wait_queue_fd);
@@ -271,7 +277,10 @@ smtp_session(struct listener *listener, int sock,
 		if (smtp_lookup_servername(s))
 			smtp_connected(s);
 	} else {
-		dns_query_ptr(s->id, (struct sockaddr *)&s->ss);
+		m_create(p_lka,  IMSG_SMTP_DNS_PTR, 0, 0, -1);
+		m_add_id(p_lka, s->id);
+		m_add_sockaddr(p_lka, (struct sockaddr *)&s->ss);
+		m_close(p_lka);
 		tree_xset(&wait_lka_ptr, s->id, s);
 	}
 
@@ -290,13 +299,13 @@ smtp_session_imsg(struct mproc *p, struct imsg *imsg)
 	struct msg			 m;
 	const char			*line, *helo;
 	uint64_t			 reqid, evpid;
-	uint32_t			 code, msgid;
+	uint32_t			 msgid;
 	int				 status, success, dnserror;
 	X509				*x;
 	void				*ssl_ctx;
 
 	switch (imsg->hdr.type) {
-	case IMSG_DNS_PTR:
+	case IMSG_SMTP_DNS_PTR:
 		m_msg(&m, imsg);
 		m_get_id(&m, &reqid);
 		m_get_int(&m, &dnserror);
@@ -311,7 +320,7 @@ smtp_session_imsg(struct mproc *p, struct imsg *imsg)
 			smtp_connected(s);
 		return;
 
-	case IMSG_LKA_EXPAND_RCPT:
+	case IMSG_SMTP_EXPAND_RCPT:
 		m_msg(&m, imsg);
 		m_get_id(&m, &reqid);
 		m_get_int(&m, &status);
@@ -336,7 +345,7 @@ smtp_session_imsg(struct mproc *p, struct imsg *imsg)
 		io_reload(&s->io);
 		return;
 
-	case IMSG_LKA_HELO:
+	case IMSG_SMTP_LOOKUP_HELO:
 		m_msg(&m, imsg);
 		m_get_id(&m, &reqid);
 		s = tree_xpop(&wait_lka_helo, reqid);
@@ -349,21 +358,7 @@ smtp_session_imsg(struct mproc *p, struct imsg *imsg)
 		smtp_connected(s);
 		return;
 
-	case IMSG_MFA_SMTP_RESPONSE:
-		m_msg(&m, imsg);
-		m_get_id(&m, &reqid);
-		m_get_int(&m, &status);
-		m_get_u32(&m, &code);
-		if (!m_is_eom(&m))
-			m_get_string(&m, &line);
-		else
-			line = NULL;
-		m_end(&m);
-		s = tree_xpop(&wait_mfa_response, reqid);
-		smtp_mfa_response(s, status, code, line);
-		return;
-
-	case IMSG_QUEUE_CREATE_MESSAGE:
+	case IMSG_SMTP_MESSAGE_CREATE:
 		m_msg(&m, imsg);
 		m_get_id(&m, &reqid);
 		m_get_int(&m, &success);
@@ -384,13 +379,15 @@ smtp_session_imsg(struct mproc *p, struct imsg *imsg)
 		io_reload(&s->io);
 		return;
 
-	case IMSG_QUEUE_MESSAGE_FILE:
+	case IMSG_SMTP_MESSAGE_OPEN:
 		m_msg(&m, imsg);
 		m_get_id(&m, &reqid);
 		m_get_int(&m, &success);
 		m_end(&m);
+
 		s = tree_xpop(&wait_queue_fd, reqid);
-		if (!success || imsg->fd == -1) {
+		if (!success || imsg->fd == -1 ||
+		    (s->ofile = fdopen(imsg->fd, "w")) == NULL) {
 			if (imsg->fd != -1)
 				close(imsg->fd);
 			smtp_reply(s, "421 %s: Temporary Error",
@@ -400,18 +397,14 @@ smtp_session_imsg(struct mproc *p, struct imsg *imsg)
 			return;
 		}
 
-		iobuf_init(&s->dataiobuf, 0, 0);
-		io_init(&s->dataio, imsg->fd, s, smtp_data_io, &s->dataiobuf);
-		s->dataeom = 0;
-
-		iobuf_fqueue(&s->dataiobuf, "Received: ");
+		fprintf(s->ofile, "Received: ");
 		if (! (s->listener->flags & F_MASK_SOURCE)) {
-			iobuf_fqueue(&s->dataiobuf, "from %s (%s [%s]);\n\t",
+			fprintf(s->ofile, "from %s (%s [%s]);\n\t",
 			    s->evp.helo,
 			    s->hostname,
 			    ss_to_text(&s->ss));
 		}
-		iobuf_fqueue(&s->dataiobuf, "by %s (%s) with %sSMTP%s%s id %08x;\n",
+		fprintf(s->ofile, "by %s (%s) with %sSMTP%s%s id %08x;\n",
 		    s->smtpname,
 		    SMTPD_NAME,
 		    s->flags & SF_EHLO ? "E" : "",
@@ -421,7 +414,7 @@ smtp_session_imsg(struct mproc *p, struct imsg *imsg)
 
 		if (s->flags & SF_SECURE) {
 			x = SSL_get_peer_certificate(s->io.ssl);
-			iobuf_fqueue(&s->dataiobuf,
+			fprintf(s->ofile,
 			    "\tTLS version=%s cipher=%s bits=%d verify=%s;\n",
 			    SSL_get_cipher_version(s->io.ssl),
 			    SSL_get_cipher_name(s->io.ssl),
@@ -432,29 +425,22 @@ smtp_session_imsg(struct mproc *p, struct imsg *imsg)
 		}
 
 		if (s->rcptcount == 1) {
-			iobuf_fqueue(&s->dataiobuf, "\tfor <%s@%s>;\n",
+			fprintf(s->ofile, "\tfor <%s@%s>;\n",
 			    s->evp.rcpt.user,
 			    s->evp.rcpt.domain);
 		}
 
-		iobuf_fqueue(&s->dataiobuf, "\t%s\n", time_to_text(time(NULL)));
-
-		/*
-		 * XXX This is not exactly fair, since this is not really
-		 * user data.
-		 */
-		s->datalen = iobuf_queued(&s->dataiobuf);
-
-		io_set_write(&s->dataio);
+		fprintf(s->ofile, "\t%s\n", time_to_text(time(NULL)));
 
 		smtp_enter_state(s, STATE_BODY);
 		smtp_reply(s, "354 Enter mail, end with \".\""
 		    " on a line by itself");
 
+		tree_xset(&wait_mfa_data, s->id, s);
 		io_reload(&s->io);
 		return;
 
-	case IMSG_QUEUE_SUBMIT_ENVELOPE:
+	case IMSG_QUEUE_ENVELOPE_SUBMIT:
 		m_msg(&m, imsg);
 		m_get_id(&m, &reqid);
 		m_get_int(&m, &success);
@@ -468,7 +454,7 @@ smtp_session_imsg(struct mproc *p, struct imsg *imsg)
 		m_end(&m);
 		return;
 
-	case IMSG_QUEUE_COMMIT_ENVELOPES:
+	case IMSG_QUEUE_ENVELOPE_COMMIT:
 		m_msg(&m, imsg);
 		m_get_id(&m, &reqid);
 		m_get_int(&m, &success);
@@ -502,16 +488,14 @@ smtp_session_imsg(struct mproc *p, struct imsg *imsg)
 		io_reload(&s->io);
 		return;
 
-	case IMSG_QUEUE_COMMIT_MESSAGE:
+	case IMSG_SMTP_MESSAGE_COMMIT:
 		m_msg(&m, imsg);
 		m_get_id(&m, &reqid);
 		m_get_int(&m, &success);
 		m_end(&m);
 		s = tree_xpop(&wait_queue_commit, reqid);
 		if (!success) {
-			m_create(p_mfa, IMSG_MFA_EVENT_ROLLBACK, 0, 0, -1);
-			m_add_id(p_mfa, s->id);
-			m_close(p_mfa);
+			smtp_filter_rollback(s);
 			smtp_reply(s, "421 %s: Temporary failure",
 			    esc_code(ESC_STATUS_TEMPFAIL, ESC_OTHER_MAIL_SYSTEM_STATUS));
 			smtp_enter_state(s, STATE_QUIT);
@@ -519,10 +503,7 @@ smtp_session_imsg(struct mproc *p, struct imsg *imsg)
 			return;
 		}
 
-		m_create(p_mfa, IMSG_MFA_EVENT_COMMIT, 0, 0, -1);
-		m_add_id(p_mfa, s->id);
-		m_close(p_mfa);
-
+		smtp_filter_commit(s);
 		smtp_reply(s, "250 %s: %08x Message accepted for delivery",
 		    esc_code(ESC_STATUS_OK, ESC_OTHER_STATUS),
 		    evpid_to_msgid(s->evp.id));
@@ -552,7 +533,7 @@ smtp_session_imsg(struct mproc *p, struct imsg *imsg)
 		io_reload(&s->io);
 		return;
 
-	case IMSG_LKA_AUTHENTICATE:
+	case IMSG_SMTP_AUTHENTICATE:
 		m_msg(&m, imsg);
 		m_get_id(&m, &reqid);
 		m_get_int(&m, &success);
@@ -587,7 +568,7 @@ smtp_session_imsg(struct mproc *p, struct imsg *imsg)
 		io_reload(&s->io);
 		return;
 
-	case IMSG_LKA_SSL_INIT:
+	case IMSG_SMTP_SSL_INIT:
 		resp_ca_cert = imsg->data;
 		s = tree_xpop(&wait_ssl_init, resp_ca_cert->reqid);
 
@@ -627,7 +608,7 @@ smtp_session_imsg(struct mproc *p, struct imsg *imsg)
 		free(resp_ca_cert);
 		return;
 
-	case IMSG_LKA_SSL_VERIFY:
+	case IMSG_SMTP_SSL_VERIFY:
 		resp_ca_vrfy = imsg->data;
 		s = tree_xpop(&wait_ssl_verify, resp_ca_vrfy->reqid);
 
@@ -650,7 +631,7 @@ smtp_session_imsg(struct mproc *p, struct imsg *imsg)
 }
 
 static void
-smtp_mfa_response(struct smtp_session *s, int status, uint32_t code,
+smtp_mfa_response(struct smtp_session *s, int msg, int status, uint32_t code,
     const char *line)
 {
 	struct ca_cert_req_msg		 req_ca_cert;
@@ -670,9 +651,9 @@ smtp_mfa_response(struct smtp_session *s, int status, uint32_t code,
 	MONKEY_SET(code, 566);
 	MONKEY_SET(line, "Chaos Monkey Caused Temporary Failure");
 
-	switch (s->mfa_imsg) {
+	switch (msg) {
 
-	case IMSG_MFA_REQ_CONNECT:
+	case IMSG_SMTP_REQ_CONNECT:
 		if (status != MFA_OK) {
 			log_info("smtp-in: Disconnecting session %016" PRIx64
 			    ": rejected by filter", s->id);
@@ -682,9 +663,13 @@ smtp_mfa_response(struct smtp_session *s, int status, uint32_t code,
 
 		if (s->listener->flags & F_SMTPS) {
 			req_ca_cert.reqid = s->id;
-			strlcpy(req_ca_cert.name, s->smtpname,
-			    sizeof req_ca_cert.name);
-			m_compose(p_lka, IMSG_LKA_SSL_INIT, 0, 0, -1,
+			if (s->listener->pki_name[0])
+				strlcpy(req_ca_cert.name, s->listener->pki_name,
+				    sizeof req_ca_cert.name);
+			else
+				strlcpy(req_ca_cert.name, s->smtpname,
+				    sizeof req_ca_cert.name);
+			m_compose(p_lka, IMSG_SMTP_SSL_INIT, 0, 0, -1,
 			    &req_ca_cert, sizeof(req_ca_cert));
 			tree_xset(&wait_ssl_init, s->id, s);
 			return;
@@ -692,7 +677,7 @@ smtp_mfa_response(struct smtp_session *s, int status, uint32_t code,
 		smtp_send_banner(s);
 		return;
 
-	case IMSG_MFA_REQ_HELO:
+	case IMSG_SMTP_REQ_HELO:
 		if (status != MFA_OK) {
 			code = code ? code : 530;
 			line = line ? line : "Hello rejected";
@@ -724,7 +709,7 @@ smtp_mfa_response(struct smtp_session *s, int status, uint32_t code,
 		io_reload(&s->io);
 		return;
 
-	case IMSG_MFA_REQ_MAIL:
+	case IMSG_SMTP_REQ_MAIL:
 		if (status != MFA_OK) {
 			code = code ? code : 530;
 			line = line ? line : "Sender rejected";
@@ -733,13 +718,13 @@ smtp_mfa_response(struct smtp_session *s, int status, uint32_t code,
 			return;
 		}
 
-		m_create(p_queue, IMSG_QUEUE_CREATE_MESSAGE, 0, 0, -1);
+		m_create(p_queue, IMSG_SMTP_MESSAGE_CREATE, 0, 0, -1);
 		m_add_id(p_queue, s->id);
 		m_close(p_queue);
 		tree_xset(&wait_queue_msg, s->id, s);
 		return;
 
-	case IMSG_MFA_REQ_RCPT:
+	case IMSG_SMTP_REQ_RCPT:
 		if (status != MFA_OK) {
 			code = code ? code : 530;
 			line = line ? line : "Recipient rejected";
@@ -755,14 +740,14 @@ smtp_mfa_response(struct smtp_session *s, int status, uint32_t code,
 			return;
 		}
 
-		m_create(p_lka, IMSG_LKA_EXPAND_RCPT, 0, 0, -1);
+		m_create(p_lka, IMSG_SMTP_EXPAND_RCPT, 0, 0, -1);
 		m_add_id(p_lka, s->id);
 		m_add_envelope(p_lka, &s->evp);
 		m_close(p_lka);
 		tree_xset(&wait_lka_rcpt, s->id, s);
 		return;
 
-	case IMSG_MFA_REQ_DATA:
+	case IMSG_SMTP_REQ_DATA:
 		if (status != MFA_OK) {
 			code = code ? code : 530;
 			line = line ? line : "Message rejected";
@@ -770,30 +755,22 @@ smtp_mfa_response(struct smtp_session *s, int status, uint32_t code,
 			io_reload(&s->io);
 			return;
 		}
-		m_create(p_queue, IMSG_QUEUE_MESSAGE_FILE, 0, 0, -1);
+		m_create(p_queue, IMSG_SMTP_MESSAGE_OPEN, 0, 0, -1);
 		m_add_id(p_queue, s->id);
 		m_add_msgid(p_queue, evpid_to_msgid(s->evp.id));
 		m_close(p_queue);
 		tree_xset(&wait_queue_fd, s->id, s);
 		return;
 
-	case IMSG_MFA_REQ_EOM:
-
+	case IMSG_SMTP_REQ_EOM:
 		if (status != MFA_OK) {
 			code = code ? code : 530;
 			line = line ? line : "Message rejected";
 			smtp_reply(s, "%d %s", code, line);
-			/* XXX enough? call rollback? */
 			io_reload(&s->io);
 			return;
 		}
-
-		s->phase = PHASE_SETUP;
-		m_create(p_queue, IMSG_QUEUE_COMMIT_MESSAGE, 0, 0, -1);
-		m_add_id(p_queue, s->id);
-		m_add_msgid(p_queue, evpid_to_msgid(s->evp.id));
-		m_close(p_queue);
-		tree_xset(&wait_queue_commit, s->id, s);
+		smtp_message_end(s);
 		return;
 
 	default:
@@ -890,7 +867,7 @@ smtp_io(struct io *io, int evt)
 					if (line[i] & 0x80)
 						line[i] = line[i] & 0x7f;
 
-			smtp_message_line(s, line);
+			smtp_message_write(s, line);
 			goto nextline;
 		}
 
@@ -907,12 +884,10 @@ smtp_io(struct io *io, int evt)
 
 		/* End of body */
 		if (s->state == STATE_BODY) {
-			log_debug("debug: smtp: %p: eom", s);
 			iobuf_normalize(&s->iobuf);
 			io_set_write(io);
-			s->dataeom = 1;
-			if (iobuf_queued(&s->dataiobuf) == 0)
-				smtp_data_io_done(s);
+
+			smtp_filter_eom(s);
 			return;
 		}
 
@@ -935,9 +910,13 @@ smtp_io(struct io *io, int evt)
 		/* Wait for the client to start tls */
 		if (s->state == STATE_TLS) {
 			req_ca_cert.reqid = s->id;
-			strlcpy(req_ca_cert.name, s->smtpname,
-			    sizeof req_ca_cert.name);
-			m_compose(p_lka, IMSG_LKA_SSL_INIT, 0, 0, -1,
+			if (s->listener->pki_name[0])
+				strlcpy(req_ca_cert.name, s->listener->pki_name,
+				    sizeof req_ca_cert.name);
+			else
+				strlcpy(req_ca_cert.name, s->smtpname,
+				    sizeof req_ca_cert.name);
+			m_compose(p_lka, IMSG_SMTP_SSL_INIT, 0, 0, -1,
 			    &req_ca_cert, sizeof(req_ca_cert));
 			tree_xset(&wait_ssl_init, s->id, s);
 			break;
@@ -966,80 +945,6 @@ smtp_io(struct io *io, int evt)
 
 	default:
 		fatalx("smtp_io()");
-	}
-}
-
-static void
-smtp_data_io(struct io *io, int evt)
-{
-	struct smtp_session    *s = io->arg;
-
-	log_trace(TRACE_IO, "smtp: %p (data): %s %s", s, io_strevent(evt),
-	    io_strio(io));
-
-	switch (evt) {
-	case IO_TIMEOUT:
-	case IO_DISCONNECTED:
-	case IO_ERROR:
-		log_debug("debug: smtp: %p: io error on mfa", s);
-		io_clear(&s->dataio);
-		iobuf_clear(&s->dataiobuf);
-		s->msgflags |= MF_ERROR_IO;
-		if (s->io.flags & IO_PAUSE_IN) {
-			log_debug("debug: smtp: %p: resuming session after mfa error", s);
-			io_resume(&s->io, IO_PAUSE_IN);
-		}
-		break;
-
-	case IO_LOWAT:
-		if (s->dataeom && iobuf_queued(&s->dataiobuf) == 0) {
-			smtp_data_io_done(s);
-		} else if (s->io.flags & IO_PAUSE_IN) {
-			log_debug("debug: smtp: %p: mfa congestion over: resuming session", s);
-			io_resume(&s->io, IO_PAUSE_IN);
-		}
-		break;
-
-	default:
-		fatalx("smtp_data_io()");
-	}
-}
-
-static void
-smtp_data_io_done(struct smtp_session *s)
-{
-	log_debug("debug: smtp: %p: data io done (%zu bytes)", s, s->datalen);
-	io_clear(&s->dataio);
-	iobuf_clear(&s->dataiobuf);
-
-	if (s->msgflags & MF_ERROR) {
-
-		/* Notify the mfa */
-		m_create(p_mfa, IMSG_MFA_EVENT_ROLLBACK, 0, 0, -1);
-		m_add_id(p_mfa, s->id);
-		m_close(p_mfa);
-
-		m_create(p_queue, IMSG_QUEUE_REMOVE_MESSAGE, 0, 0, -1);
-		m_add_msgid(p_queue, evpid_to_msgid(s->evp.id));
-		m_close(p_queue);
-		if (s->msgflags & MF_ERROR_SIZE)
-			smtp_reply(s, "554 %s %s: Transaction failed, message too big",
-			    esc_code(ESC_STATUS_PERMFAIL, ESC_MESSAGE_TOO_BIG_FOR_SYSTEM),
-			    esc_description(ESC_MESSAGE_TOO_BIG_FOR_SYSTEM));
-		else if (s->msgflags)
-			smtp_reply(s, "421 %s %s: Internal Error",
-			    esc_code(ESC_STATUS_TEMPFAIL, ESC_OTHER_MAIL_SYSTEM_STATUS),
-			    esc_description(ESC_OTHER_MAIL_SYSTEM_STATUS));
-		smtp_message_reset(s, 0);
-		smtp_enter_state(s, STATE_HELO);
-		io_reload(&s->io);
-	}
-	else {
-		m_create(p_mfa, IMSG_MFA_REQ_EOM, 0, 0, -1);
-		m_add_id(p_mfa, s->id);
-		m_add_u32(p_mfa, s->datalen);
-		m_close(p_mfa);
-		smtp_wait_mfa(s, IMSG_MFA_REQ_EOM);
 	}
 }
 
@@ -1123,7 +1028,7 @@ smtp_command(struct smtp_session *s, char *line)
 			break;
 		}
 		strlcpy(s->helo, args, sizeof(s->helo));
-		s->flags &= SF_SECURE | SF_AUTHENTICATED | SF_VERIFIED | SF_MFACONNSENT;
+		s->flags &= SF_SECURE | SF_AUTHENTICATED | SF_VERIFIED;
 		if (cmd == CMD_EHLO) {
 			s->flags |= SF_EHLO;
 			s->flags |= SF_8BITMIME;
@@ -1131,12 +1036,7 @@ smtp_command(struct smtp_session *s, char *line)
 
 		smtp_message_reset(s, 1);
 
-		m_create(p_mfa, IMSG_MFA_REQ_HELO, 0, 0, -1);
-		m_add_id(p_mfa, s->id);
-		m_add_string(p_mfa, s->helo);
-		m_close(p_mfa);
-		smtp_wait_mfa(s, IMSG_MFA_REQ_HELO);
-
+		smtp_filter_helo(s);
 		break;
 	/*
 	 * SETUP
@@ -1265,11 +1165,7 @@ smtp_command(struct smtp_session *s, char *line)
 		if (args && smtp_parse_mail_args(s, args) == -1)
 			break;
 
-		m_create(p_mfa, IMSG_MFA_REQ_MAIL, 0, 0, -1);
-		m_add_id(p_mfa, s->id);
-		m_add_mailaddr(p_mfa, &s->evp.sender);
-		m_close(p_mfa);
-		smtp_wait_mfa(s, IMSG_MFA_REQ_MAIL);
+		smtp_filter_mail(s);
 		break;
 	/*
 	 * TRANSACTION
@@ -1299,11 +1195,7 @@ smtp_command(struct smtp_session *s, char *line)
 		if (args && smtp_parse_rcpt_args(s, args) == -1)
 			break;
 
-		m_create(p_mfa, IMSG_MFA_REQ_RCPT, 0, 0, -1);
-		m_add_id(p_mfa, s->id);
-		m_add_mailaddr(p_mfa, &s->evp.rcpt);
-		m_close(p_mfa);
-		smtp_wait_mfa(s, IMSG_MFA_REQ_RCPT);
+		smtp_filter_rcpt(s);
 		break;
 
 	case CMD_RSET:
@@ -1314,12 +1206,10 @@ smtp_command(struct smtp_session *s, char *line)
 			break;
 		}
 
-		m_create(p_mfa, IMSG_MFA_EVENT_RSET, 0, 0, -1);
-		m_add_id(p_mfa, s->id);
-		m_close(p_mfa);
+		smtp_filter_rset(s);
 
 		if (s->evp.id) {
-			m_create(p_queue, IMSG_QUEUE_REMOVE_MESSAGE, 0, 0, -1);
+			m_create(p_queue, IMSG_SMTP_MESSAGE_ROLLBACK, 0, 0, -1);
 			m_add_msgid(p_queue, evpid_to_msgid(s->evp.id));
 			m_close(p_queue);
 		}
@@ -1344,10 +1234,7 @@ smtp_command(struct smtp_session *s, char *line)
 			break;
 		}
 
-		m_create(p_mfa, IMSG_MFA_REQ_DATA, 0, 0, -1);
-		m_add_id(p_mfa, s->id);
-		m_close(p_mfa);
-		smtp_wait_mfa(s, IMSG_MFA_REQ_DATA);
+		smtp_filter_data(s);
 		break;
 	/*
 	 * ANY
@@ -1426,7 +1313,7 @@ smtp_rfc4954_auth_plain(struct smtp_session *s, char *arg)
 			goto abort;
 		pass++; /* skip NUL */
 
-		m_create(p_lka,  IMSG_LKA_AUTHENTICATE, 0, 0, -1);
+		m_create(p_lka,  IMSG_SMTP_AUTHENTICATE, 0, 0, -1);
 		m_add_id(p_lka, s->id);
 		m_add_string(p_lka, s->listener->authtable);
 		m_add_string(p_lka, user);
@@ -1473,7 +1360,7 @@ smtp_rfc4954_auth_login(struct smtp_session *s, char *arg)
 				  sizeof(buf)-1) == -1)
 			goto abort;
 
-		m_create(p_lka,  IMSG_LKA_AUTHENTICATE, 0, 0, -1);
+		m_create(p_lka,  IMSG_SMTP_AUTHENTICATE, 0, 0, -1);
 		m_add_id(p_lka, s->id);
 		m_add_string(p_lka, s->listener->authtable);
 		m_add_string(p_lka, s->username);
@@ -1604,7 +1491,7 @@ smtp_lookup_servername(struct smtp_session *s)
 			log_warn("warn: getsockname()");
 		}
 		else {
-			m_create(p_lka, IMSG_LKA_HELO, 0, 0, -1);
+			m_create(p_lka, IMSG_SMTP_LOOKUP_HELO, 0, 0, -1);
 			m_add_id(p_lka, s->id);
 			m_add_string(p_lka, s->listener->hostnametable);
 			m_add_sockaddr(p_lka, sa);
@@ -1633,20 +1520,14 @@ smtp_connected(struct smtp_session *s)
 		return;
 	}
 
-	m_create(p_mfa, IMSG_MFA_REQ_CONNECT, 0, 0, -1);
-	m_add_id(p_mfa, s->id);
-	m_add_sockaddr(p_mfa, (struct sockaddr *)&ss);
-	m_add_sockaddr(p_mfa, (struct sockaddr *)&s->ss);
-	m_add_string(p_mfa, s->hostname);
-	m_close(p_mfa);
 	s->flags |= SF_MFACONNSENT;
-	smtp_wait_mfa(s, IMSG_MFA_REQ_CONNECT);
+	smtp_filter_connect(s, (struct sockaddr *)&ss);
 }
 
 static void
 smtp_send_banner(struct smtp_session *s)
 {
-	smtp_reply(s, SMTPD_BANNER, s->smtpname, SMTPD_NAME);
+	smtp_reply(s, "220 %s ESMTP %s", s->smtpname, SMTPD_NAME);
 	io_reload(&s->io);
 }
 
@@ -1661,14 +1542,14 @@ smtp_enter_state(struct smtp_session *s, int newstate)
 }
 
 static void
-smtp_message_line(struct smtp_session *s, const char *line)
+smtp_message_write(struct smtp_session *s, const char *line)
 {
 	size_t	len;
 
 	log_trace(TRACE_SMTP, "<<< [MSG] %s", line);
 
-	/* Ignore lines if there is an error */
-	if (s->msgflags & MF_ERROR)
+	/* Don't waste resources on message if it's going to bin anyway. */
+	if (s->msgflags & (MF_ERROR_IO | MF_ERROR_SIZE | MF_ERROR_MFA))
 		return;
 
 	len = strlen(line) + 1;
@@ -1678,17 +1559,46 @@ smtp_message_line(struct smtp_session *s, const char *line)
 		return;
 	}
 
-	s->datalen += len;
-
-#define DATAIO_HIWAT	65536
-
-	iobuf_fqueue(&s->dataiobuf, "%s\n", line);
-	if (iobuf_len(&s->dataiobuf) >= DATAIO_HIWAT && !(s->io.flags & IO_PAUSE_IN)) {
-		log_debug("debug: smtp: %p: mfa congestion: pausing session", s);
-		io_pause(&s->io, IO_PAUSE_IN);
+	if (fprintf(s->ofile, "%s\n", line) != (int)len) {
+		s->msgflags |= MF_ERROR_IO;
+		return;
 	}
 
-	io_reload(&s->dataio);
+	s->datalen += len;
+}
+
+static void
+smtp_message_end(struct smtp_session *s)
+{
+	log_debug("debug: %p: end of message, msgflags=0x%04x", s, s->msgflags);
+
+	tree_xpop(&wait_mfa_data, s->id);
+
+	s->phase = PHASE_SETUP;
+
+	fclose(s->ofile);
+	s->ofile = NULL;
+
+	if (s->msgflags & (MF_ERROR_SIZE | MF_ERROR_MFA | MF_ERROR_IO)) {
+		m_create(p_queue, IMSG_SMTP_MESSAGE_ROLLBACK, 0, 0, -1);
+		m_add_msgid(p_queue, evpid_to_msgid(s->evp.id));
+		m_close(p_queue);
+		if (s->msgflags & MF_ERROR_SIZE)
+			smtp_reply(s, "554 %s %s: Transaction failed, message too big",
+			    esc_code(ESC_STATUS_PERMFAIL, ESC_MESSAGE_TOO_BIG_FOR_SYSTEM),
+			    esc_description(ESC_MESSAGE_TOO_BIG_FOR_SYSTEM));
+		else
+			smtp_reply(s, "%d Message rejected", s->msgcode);
+		smtp_message_reset(s, 0);
+		smtp_enter_state(s, STATE_HELO);
+		return;
+	}
+
+	m_create(p_queue, IMSG_SMTP_MESSAGE_COMMIT, 0, 0, -1);
+	m_add_id(p_queue, s->id);
+	m_add_msgid(p_queue, evpid_to_msgid(s->evp.id));
+	m_close(p_queue);
+	tree_xset(&wait_queue_commit, s->id, s);
 }
 
 static void
@@ -1761,34 +1671,26 @@ smtp_reply(struct smtp_session *s, char *fmt, ...)
 }
 
 static void
-smtp_wait_mfa(struct smtp_session *s, int type)
-{
-	s->mfa_imsg = type;
-	tree_xset(&wait_mfa_response, s->id, s);	
-}
-
-static void
 smtp_free(struct smtp_session *s, const char * reason)
 {
 	struct smtp_rcpt	*rcpt;
 
 	log_debug("debug: smtp: %p: deleting session: %s", s, reason);
 
-	tree_pop(&wait_mfa_response, s->id);
+	tree_pop(&wait_mfa_data, s->id);
 
-	io_clear(&s->dataio);
-	iobuf_clear(&s->dataiobuf);
+	if (s->ofile)
+		fclose(s->ofile);
 
 	if (s->evp.id) {
-		m_create(p_queue, IMSG_QUEUE_REMOVE_MESSAGE, 0, 0, -1);
+		m_create(p_queue, IMSG_SMTP_MESSAGE_ROLLBACK, 0, 0, -1);
 		m_add_msgid(p_queue, evpid_to_msgid(s->evp.id));
 		m_close(p_queue);
 	}
-	if (s->flags & SF_MFACONNSENT) {
-		m_create(p_mfa, IMSG_MFA_EVENT_DISCONNECT, 0, 0, -1);
-		m_add_id(p_mfa, s->id);
-		m_close(p_mfa);
-	}
+
+	if (s->flags & SF_MFACONNSENT)
+		smtp_filter_disconnect(s);
+
 	if (s->flags & SF_SECURE && s->listener->flags & F_SMTPS)
 		stat_decrement("smtp.smtps", 1);
 	if (s->flags & SF_SECURE && s->listener->flags & F_STARTTLS)
@@ -1902,7 +1804,7 @@ smtp_verify_certificate(struct smtp_session *s)
 	iov[0].iov_len = sizeof(req_ca_vrfy);
 	iov[1].iov_base = req_ca_vrfy.cert;
 	iov[1].iov_len = req_ca_vrfy.cert_len;
-	m_composev(p_lka, IMSG_LKA_SSL_VERIFY_CERT, 0, 0, -1,
+	m_composev(p_lka, IMSG_SMTP_SSL_VERIFY_CERT, 0, 0, -1,
 	    iov, nitems(iov));
 	free(req_ca_vrfy.cert);
 	X509_free(x);
@@ -1918,7 +1820,7 @@ smtp_verify_certificate(struct smtp_session *s)
 			iov[0].iov_len  = sizeof(req_ca_vrfy);
 			iov[1].iov_base = req_ca_vrfy.cert;
 			iov[1].iov_len  = req_ca_vrfy.cert_len;
-			m_composev(p_lka, IMSG_LKA_SSL_VERIFY_CHAIN, 0, 0, -1,
+			m_composev(p_lka, IMSG_SMTP_SSL_VERIFY_CHAIN, 0, 0, -1,
 			    iov, nitems(iov));
 			free(req_ca_vrfy.cert);
 		}
@@ -1927,7 +1829,7 @@ smtp_verify_certificate(struct smtp_session *s)
 	/* Tell lookup process that it can start verifying, we're done */
 	memset(&req_ca_vrfy, 0, sizeof req_ca_vrfy);
 	req_ca_vrfy.reqid = s->id;
-	m_compose(p_lka, IMSG_LKA_SSL_VERIFY, 0, 0, -1,
+	m_compose(p_lka, IMSG_SMTP_SSL_VERIFY, 0, 0, -1,
 	    &req_ca_vrfy, sizeof req_ca_vrfy);
 
 	return 1;
@@ -1972,13 +1874,69 @@ smtp_sni_callback(SSL *ssl, int *ad, void *arg)
 	}
 	ssl_ctx = dict_get(env->sc_ssl_dict, sn);
 	if (ssl_ctx == NULL) {
-		log_warnx("warn: SNI name not found in PKI");
+		log_info("smtp-in: No PKI entry for requested SNI \"%s\""
+		    "on session %016"PRIx64, sn, s->id);
 		return SSL_TLSEXT_ERR_NOACK;
 	}
 	SSL_set_SSL_CTX(ssl, ssl_ctx);
 	return SSL_TLSEXT_ERR_OK;
 }
 
+static void
+smtp_filter_rset(struct smtp_session *s)
+{
+}
+
+static void
+smtp_filter_commit(struct smtp_session *s)
+{
+}
+
+static void
+smtp_filter_rollback(struct smtp_session *s)
+{
+}
+
+static void
+smtp_filter_disconnect(struct smtp_session *s)
+{
+}
+
+static void
+smtp_filter_connect(struct smtp_session *s, struct sockaddr *sa)
+{
+	smtp_mfa_response(s, IMSG_SMTP_REQ_CONNECT, MFA_OK, 0, NULL);
+}
+
+static void
+smtp_filter_eom(struct smtp_session *s)
+{
+	smtp_mfa_response(s, IMSG_SMTP_REQ_EOM, MFA_OK, 0, NULL);
+}
+
+static void
+smtp_filter_helo(struct smtp_session *s)
+{
+	smtp_mfa_response(s, IMSG_SMTP_REQ_HELO, MFA_OK, 0, NULL);
+}
+
+static void
+smtp_filter_mail(struct smtp_session *s)
+{
+	smtp_mfa_response(s, IMSG_SMTP_REQ_MAIL, MFA_OK, 0, NULL);
+}
+
+static void
+smtp_filter_rcpt(struct smtp_session *s)
+{
+	smtp_mfa_response(s, IMSG_SMTP_REQ_RCPT, MFA_OK, 0, NULL);
+}
+
+static void
+smtp_filter_data(struct smtp_session *s)
+{
+	smtp_mfa_response(s, IMSG_SMTP_REQ_DATA, MFA_OK, 0, NULL);
+}
 
 #define CASE(x) case x : return #x
 
