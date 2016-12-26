@@ -31,6 +31,10 @@
 
 /* Constants */
 
+#ifndef WAIT_MYPGRP
+# define WAIT_MYPGRP 0
+#endif
+
 #ifndef HOST_NAME_MAX
 # ifdef _POSIX_HOST_NAME_MAX
 # define HOST_NAME_MAX _POSIX_HOST_NAME_MAX
